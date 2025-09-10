@@ -16,33 +16,55 @@ ConditionType = Float[Tensor, "batch *yshape"]
 TimeType = Float[Tensor, "batch"]
 
 
-class SIModuleConfig(torch.nn.Module):
+# TODO: Finish this module
+
+class EDMModuleConfig(torch.nn.Module):
     def __init__(self,
-                 scheduler: Literal['linear', 'cosine'] = 'linear',
                  num_channels: int | None = None,
                  initial_norm: bool = False,
-                 loss_metric: Literal['mse', 'huber'] = 'huber'):
+                 loss_metric: Literal['mse', 'huber'] = 'huber',
+                 sigma_data: float = 0.5,
+                 prior_mean: float = -1.2,
+                 prior_std: float = 1.2,
+                 sigma_min: float = 0.002,
+                 sigma_max: float = 80.0,
+                 expoent_steps: float = 7.0):
+
         super().__init__()
-        self.scheduler = scheduler
         self.num_channels = num_channels
         self.initial_norm = initial_norm
         self.loss_metric = loss_metric
-        self.set_scheduling_functions()
+
+        self.sigma_data = sigma_data
+        self.prior_mean = prior_mean
+        self.prior_std = prior_std
+
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.expoent_steps = expoent_steps
+
+        self.set_edm_functions()
         self.set_loss_metric_module()
 
-    def set_scheduling_functions(self):
-        if self.scheduler == 'linear':
-            self.alpha_fn = lambda t: 1 - t  # noqa
-            self.sigma_fn = lambda t: t  # noqa
-            self.alpha_fn_dot = lambda t: -1 * torch.ones_like(t)  # noqa
-            self.sigma_fn_dot = lambda t: torch.ones_like(t)  # noqa
-        elif self.scheduler == 'cosine':
-            self.alpha_fn = lambda t: torch.cos(t * np.pi / 2)  # noqa
-            self.sigma_fn = lambda t: torch.sin(t * np.pi / 2)  # noqa
-            self.alpha_fn_dot = lambda t: -1 * torch.pi / 2 * torch.sin(t * np.pi / 2)  # noqa
-            self.sigma_fn_dot = lambda t: torch.pi / 2 * torch.cos(t * np.pi / 2)  # noqa
-        else:
-            raise ValueError(f"Invalid scheduler: {self.scheduler}")
+    def set_edm_functions(self):
+        self.loss_weighting = lambda sigma: (sigma**2 + self.sigma_data**2)/((sigma*self.sigma_data)**2)
+        self.noise_conditioner = lambda sigma: 0.5*torch.log(sigma)
+        self.input_scaling = lambda sigma: 1/torch.sqrt(sigma**2 + self.sigma_data**2)
+        self.output_scaling = lambda sigma: sigma*self.sigma_data/torch.sqrt(sigma**2 + self.sigma_data**2)
+        self.skip_scaling = lambda sigma: self.sigma_data**2/(sigma**2 + self.sigma_data**2)
+
+    def sample_sigma(self, shape: list[int]) -> Float[Tensor, "batch"]:
+        white_noise = torch.randn(shape)
+        logsigma = white_noise*self.prior_std + self.prior_mean
+        sigma = torch.exp(logsigma)
+        return sigma
+
+    def create_sigma_steps(self, n: int) -> Float[Tensor, "n"]:
+        s = torch.arange(n) / (n)
+        start = self.sigma_max**(1/self.expoent_steps)
+        end = self.sigma_min**(1/self.expoent_steps)
+        steps = (start + s*(end - start))**(self.expoent_steps) + 1e-6
+        return steps
 
     def set_loss_metric_module(self):
         if self.loss_metric == 'mse':
@@ -53,8 +75,8 @@ class SIModuleConfig(torch.nn.Module):
             raise ValueError(f"Invalid loss metric: {self.loss_metric}")
 
 
-class SIModule(lightning.LightningModule):
-    def __init__(self, config: SIModuleConfig, model: nn.Module):
+class EDMModule(lightning.LightningModule):
+    def __init__(self, config: EDMModuleConfig, model: nn.Module):
         super().__init__()
         self.config = config
         self.model = model
@@ -66,23 +88,28 @@ class SIModule(lightning.LightningModule):
         else:
             self.initial_norm = IdentityBatchNorm()
 
+    def encode(self, x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+               y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821, typing
+               ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
+        return self.initial_norm(x)
+
+    def decode(self, x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+               y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821, typing
+               ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
+        return self.initial_norm.unnorm(x)
+
     def loss_fn(self,
                 x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
-                t: Float[Tensor, "batch"],  # noqa: F821, typing
+                sigma: Float[Tensor, "batch"],  # noqa: F821, typing
                 y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821, typing
                 mask: None | Float[Tensor, "batch *shape"] = None  # noqa: F821, typing
                 ) -> Float[Tensor, ""]:  # noqa: F821, F722
-        x = self.initial_norm(x)
+        x = self.encode(x, y)
         noise = torch.randn_like(x)
-        t_broadcasted = broadcast_from_below(t, x)
-        alpha, sigma = self.config.alpha_fn(t_broadcasted), self.config.sigma_fn(t_broadcasted)
-        x_noised = alpha * x + sigma * noise
-        flow_field = self.model(x_noised, t, y=y)
-
-        alpha_dot, sigma_dot = self.config.alpha_fn_dot(t_broadcasted), self.config.sigma_fn_dot(t_broadcasted)
-        target = (alpha_dot * x + sigma_dot * noise)
-
-        loss = self.config.loss_metric_module(flow_field, target)
+        broadcasted_sigma = broadcast_from_below(sigma, x)  # [nbatch, *1]
+        x_noised = x + broadcasted_sigma * noise
+        denoised = self.evaluate_denoiser(x_noised, sigma, y)
+        loss = self.config.loss_metric_module(denoised, x)
         if mask is not None:
             # Apply the mask if it is provided
             # We assume that the mask is 1 where the data is absent
@@ -91,16 +118,48 @@ class SIModule(lightning.LightningModule):
         loss = loss.mean()
         return loss
 
-    def sample_timestep(self, nsamples):
-        # Sample from uniform 0 and 1
-        t = torch.rand(nsamples)
-        return t
+    def evaluate_denoiser(self,
+                          x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+                          sigma: Float[Tensor, "batch"],  # noqa: F821, typing
+                          y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821, typing
+                          guidance: float = 1.0
+                          ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
+        input_scale_factor = self.config.input_scaling(
+            sigma)  # [nbatch]
+        input_scale_factor = broadcast_from_below(input_scale_factor,
+                                                  x_noised)  # [nbatch, *1]
+        output_scale_factor = self.config.output_scaling(
+            sigma)  # [nbatch]
+        output_scale_factor = broadcast_from_below(output_scale_factor,
+                                                   x_noised)  # [nbatch, *1]
+        skip_scale_factor = self.config.skip_scaling(
+            sigma)  # [nbatch]
+        skip_scale_factor = broadcast_from_below(skip_scale_factor,
+                                                 x_noised)  # [nbatch, *1]
+        scaled_input = input_scale_factor*x_noised  # [nbatch, *shapex]
+        cond_noise = self.config.noise_conditioner(
+            sigma)  # [nbatch]
+        if y is not None and guidance != 0.0:
+            base_score = self.model(scaled_input,
+                                    cond_noise,
+                                    y)  # [nbatch, *shape]
+            if guidance != 1.0:
+                uncond_base_score = self.model(scaled_input,
+                                               cond_noise)
+                base_score = ((1 - guidance)*uncond_base_score +
+                              guidance*base_score)
+        else:
+            base_score = self.model(scaled_input,
+                                    cond_noise)  # [nbatch, *shape]
+        scaled_output = output_scale_factor*base_score  # [nbatch, *shape]
+        denoiser = scaled_output + skip_scale_factor*x_noised  # [nbatch, *shape]
+        return denoiser
 
     def training_step(self, batch, batch_idx):
         x = batch['x']
         y = batch.get('y', None)
         mask = batch.get('mask', None)
-        t = self.sample_timestep(x.shape[0]).to(x)
+        sigma = self.sample_sigmastep(x.shape[0]).to(x)
         loss = self.loss_fn(x, t, y, mask)
         self.log('train_loss', loss, prog_bar=True, sync_dist=True)
         return loss
@@ -156,19 +215,6 @@ class SIModule(lightning.LightningModule):
 
         return [self.optimizer], [lr_scheduler_config]
 
-    def get_flow_field(
-            self,
-            x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
-            t: Float[Tensor, "batch"],  # noqa: F821, typing
-            guidance: float = 1.0,
-            y: None | Float[Tensor, "*yshape"] = None  # noqa: F821, typing
-    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
-        if guidance == 1.0 or y is None:  # Implictly no guidance
-            flow_field = self.model(x_noised, t, y=y)
-        else:
-            flow_field = guidance * self.model(x_noised, t, y=y) + (1 - guidance) * self.model(x_noised, t, y=None)
-        return flow_field
-
     def sample(self,
                nsamples: int,
                shape: list[int],
@@ -180,11 +226,20 @@ class SIModule(lightning.LightningModule):
             x = torch.randn(nsamples, *shape).to(self.device)
             if y is not None:
                 y = dict_unsqueeze(y, 0)
-            time_schedule = torch.linspace(1, 0, nsteps).to(x)
-            x = self.integrate_flow_field(x, time_schedule, y, guidance)
+            sigma_steps = self.config.create_sigma_steps(nsteps).to(x)
+            x = self.integrate_probability_flow(x, sigma_steps, y, guidance)
         return x  # noqa: F821, F722
 
-    def integrate_flow_field(
+    def get_probability_flow_rhs(self,
+                                 x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+                                 sigma: Float[Tensor, "batch"],  # noqa: F821, typing
+                                 y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
+                                 guidance: float = 1.0
+                                 ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
+        denoised = self.evaluate_denoiser(x_noised, sigma, y, guidance)
+        return -(denoised - x_noised)/(sigma)
+
+    def integrate_probability_flow(
         self,
         x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
         time_schedule: Float[Tensor, "nsteps"],  # noqa: F821, typing
@@ -217,8 +272,8 @@ class SIModule(lightning.LightningModule):
                 history.append((time_schedule[i + 1], x))
 
         if not return_history:
-            x = self.initial_norm.unnorm(x)
+            x = self.decode(x)
             return x
         else:
-            history = list(map(lambda tx: (tx[0], self.initial_norm.unnorm(tx[1])), history))
+            history = list(map(lambda tx: (tx[0], self.decode(tx[1])), history))
             return history

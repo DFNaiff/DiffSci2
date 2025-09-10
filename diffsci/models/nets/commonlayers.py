@@ -808,6 +808,8 @@ class CircularConv2d(torch.nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.padding = kernel_size//2
+        
+        kwargs['padding'] = 0
         self.conv = torch.nn.Conv2d(in_channels,
                                     out_channels,
                                     kernel_size,
@@ -817,7 +819,8 @@ class CircularConv2d(torch.nn.Module):
 
     def forward(self, x):
         x = self.pad(x)
-        return self.conv(x)
+        x = self.conv(x)
+        return x
 
 
 class CircularConv3d(torch.nn.Module):
