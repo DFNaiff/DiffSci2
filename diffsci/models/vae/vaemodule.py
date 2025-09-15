@@ -4,6 +4,7 @@ from typing import Literal, Dict, Callable
 import torch
 import torchvision
 import lightning
+import lightning.pytorch.callbacks as pl_callbacks
 from torch import Tensor
 from jaxtyping import Float
 
@@ -19,6 +20,19 @@ def default_scheduler(optimizer):
         optimizer,
         lr_lambda=lambda step: 1.0 + 0*step
     )
+
+
+# Add KL annealing for stable training
+class KLAnnealingCallback(pl_callbacks.Callback):
+    def __init__(self, n_epochs=5, maximum_kl_weight=0.1):
+        self.n_epochs = n_epochs
+        self.maximum_kl_weight = maximum_kl_weight
+        
+    def on_train_epoch_start(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        if epoch < self.n_epochs:
+            weight = min(1.0, (epoch / self.n_epochs)) * self.maximum_kl_weight
+            pl_module.loss_module.config.kl_weight = weight
 
 
 class VAEModuleConfig:
@@ -225,13 +239,13 @@ class VAELoss(torch.nn.Module):
             loss, logs = self.distillation_loss(x, vae_module, y, None, None)
             if return_intermediates:
                 # For distillation-only, we still need to compute these
-                encoder_outputs = vae_module.encode(x, y)
+                encoder_outputs = vae_module.encode(x, y, preencode=False)
                 x_recon = vae_module.decode(encoder_outputs['zsample'], y)
                 return loss, logs, encoder_outputs, x_recon
             return loss, logs
 
-        encoder_outputs = vae_module.encode(x, y)
-        x_recon = vae_module.decode(encoder_outputs['zsample'], y)
+        encoder_outputs = vae_module.encode(x, y, preencode=False)
+        x_recon = vae_module.decode(encoder_outputs['zsample'], y, postdecode=False)
         zdistrib = encoder_outputs['zdistrib']
 
         reduce_mean = self.config.reduce_mean
@@ -288,14 +302,14 @@ class VAELoss(torch.nn.Module):
                     self.config.teacher_encdec.encoder(x))
                 zsample = zdistrib.sample()
             else:
-                zdistrib = vae_module.encode(x, y)['zdistrib']
+                zdistrib = vae_module.encode(x, y, preencode=False)['zdistrib']
                 zsample = zdistrib.sample()
 
         if x_recon is None:
             if self.config.teaching_mode == "encoder":
                 x_recon = 0.0  # It will be ignored
             else:
-                x_recon = vae_module.decode(zsample, y)
+                x_recon = vae_module.decode(zsample, y, postdecode=False)
 
         if self.config.teaching_mode == "decoder":
             latent_space_matching_loss = torch.tensor(0.0).to(x)
@@ -407,7 +421,7 @@ class VAEModule(lightning.LightningModule):
     def encode(self, x: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
                y: Float[Tensor, "batch *yshape"] | None = None,  # noqa: F821, F722
                sample: bool = True,
-               preencode: bool = None):
+               preencode: bool | None = None):
         if preencode is None:
             preencode = not self.training
         if preencode:
@@ -476,8 +490,8 @@ class VAEModule(lightning.LightningModule):
         x = self.preencode(x, y)
         # Generate fake samples (no gradients to generator)
         with torch.no_grad():
-            encoder_outputs = self.encode(x, y)
-            x_fake = self.decode(encoder_outputs['zsample'], y)
+            encoder_outputs = self.encode(x, y, preencode=False)
+            x_fake = self.decode(encoder_outputs['zsample'], y, postdecode=False)
 
         # Discriminator predictions
         if self.conditional and y is not None:
@@ -568,8 +582,9 @@ class VAEModule(lightning.LightningModule):
         if batch_idx == 0:  # Only log for the first batch to avoid flooding
             x, y = self.select_batch(batch)
             x = self.preencode(x, y)
-            encoder_outputs = self.encode(x, y)
-            x_recon = self.decode(encoder_outputs['zsample'], y)
+            encoder_outputs = self.encode(x, y, preencode=False)
+            x_recon = self.decode(encoder_outputs['zsample'], y, postdecode=False)
+            # x_recon = self.postdecode(x_recon, y)
             # Log images
             self.log_images_to_tensorboard(x, x_recon, batch_idx)
 

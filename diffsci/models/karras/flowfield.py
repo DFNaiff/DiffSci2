@@ -177,11 +177,12 @@ class SIModule(lightning.LightningModule):
                nsteps: int = 30
                ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
         if torch.inference_mode():
-            x = torch.randn(nsamples, *shape).to(self.device)
-            if y is not None:
-                y = dict_unsqueeze(y, 0)
-            time_schedule = torch.linspace(1, 0, nsteps).to(x)
-            x = self.integrate_flow_field(x, time_schedule, y, guidance)
+            with torch.no_grad():
+                x = torch.randn(nsamples, *shape).to(self.device)
+                if y is not None:
+                    y = dict_unsqueeze(y, 0)
+                time_schedule = torch.linspace(1, 0, nsteps).to(x)
+                x = self.integrate_flow_field(x, time_schedule, y, guidance)
         return x  # noqa: F821, F722
 
     def integrate_flow_field(
