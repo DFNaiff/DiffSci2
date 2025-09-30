@@ -494,7 +494,7 @@ class KarrasModule(lightning.LightningModule):
                 if y is not None:
                     y = dict_to(y, self.device)
                 # Ideally we do not enter here and is_latent_shape is True
-                if self.latent_model and not is_latent_shape:  # TODO: A stupid hack. Should be improved
+                if self.latent_model and not is_latent_shape:  # TODO: A stupid n. Should be improved
                     if self.encode_y:  # FIXME: What the fuck is this code?
                         if self.decode_original_y:
                             original_y = y.copy()

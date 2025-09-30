@@ -2,12 +2,14 @@ from typing import Literal
 from jaxtyping import Float
 from torch import Tensor
 
+import warnings
+
 import torch
 import torch.nn as nn
 import numpy as np
 import lightning
 
-from diffsci.torchutils import broadcast_from_below, dict_unsqueeze
+from diffsci.torchutils import broadcast_from_below, dict_unsqueeze, dict_to
 from diffsci.models.aux_scripts import DimensionAgnosticBatchNorm, IdentityBatchNorm, HyperparameterManager
 
 
@@ -21,12 +23,16 @@ class SIModuleConfig(torch.nn.Module):
                  scheduler: Literal['linear', 'cosine'] = 'linear',
                  num_channels: int | None = None,
                  initial_norm: bool = False,
-                 loss_metric: Literal['mse', 'huber'] = 'huber'):
+                 loss_metric: Literal['mse', 'huber'] = 'huber',
+                 autoencoder_is_conditional: bool = False,
+                 encode_condition: bool = False):
         super().__init__()
         self.scheduler = scheduler
         self.num_channels = num_channels
         self.initial_norm = initial_norm
         self.loss_metric = loss_metric
+        self.autoencoder_is_conditional = autoencoder_is_conditional
+        self.encode_condition = encode_condition
         self.set_scheduling_functions()
         self.set_loss_metric_module()
 
@@ -54,11 +60,49 @@ class SIModuleConfig(torch.nn.Module):
 
 
 class SIModule(lightning.LightningModule):
-    def __init__(self, config: SIModuleConfig, model: nn.Module):
+    def __init__(
+        self,
+        config: SIModuleConfig,
+        model: nn.Module,
+        autoencoder: nn.Module | None = None
+    ):
         super().__init__()
         self.config = config
         self.model = model
         self.set_initial_norm()
+        self.autoencoder = autoencoder
+        if self.autoencoder:
+            self.freeze_autoencoder()
+
+    def freeze_autoencoder(self):
+        """
+        Freezes the autoencoder to prevent its weights from being updated
+        during training.
+        """
+        for param in self.autoencoder.parameters():
+            param.requires_grad = False
+
+    def encode(self, x, y=None):
+        if not self.autoencoder:
+            return x, y
+        if not self.config.autoencoder_is_conditional and not self.config.encode_condition:
+            x = self.autoencoder.encode(x)
+        elif self.config.autoencoder_is_conditional and not self.config.encode_condition:
+            x = self.autoencoder.encode(x, y)
+        elif not self.config.autoencoder_is_conditional and self.config.encode_condition:
+            raise ValueError("Cannot encode condition if autoencoder is not conditional")
+        else:
+            x, y = self.autoencoder.encode(x, y)
+        return x, y
+
+    def decode(self, x, y=None):
+        if not self.autoencoder:
+            return x, y
+        if not self.config.autoencoder_is_conditional:
+            x = self.autoencoder.decode(x)
+        else:
+            x = self.autoencoder.decode(x, y)
+        return x, y
 
     def set_initial_norm(self):
         if self.config.initial_norm:
@@ -72,6 +116,7 @@ class SIModule(lightning.LightningModule):
                 y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821, typing
                 mask: None | Float[Tensor, "batch *shape"] = None  # noqa: F821, typing
                 ) -> Float[Tensor, ""]:  # noqa: F821, F722
+        x, y = self.encode(x, y)
         x = self.initial_norm(x)
         noise = torch.randn_like(x)
         t_broadcasted = broadcast_from_below(t, x)
@@ -174,16 +219,44 @@ class SIModule(lightning.LightningModule):
                shape: list[int],
                y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
                guidance: float = 1.0,
-               nsteps: int = 30
+               nsteps: int = 30,
+               is_latent_shape: bool = False
                ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
         if torch.inference_mode():
             with torch.no_grad():
                 x = torch.randn(nsamples, *shape).to(self.device)
                 if y is not None:
+                    warnings.warn("Moving y to device: {}".format(self.device))
+                    y = dict_to(y, self.device)
+                if not is_latent_shape and self.autoencoder:
+                    # Need to do a stupid hack for getting correct shape
+                    x, _ = self.encode(x, y)
+                    x = torch.randn_like(x)
+                if y is not None:
                     y = dict_unsqueeze(y, 0)
                 time_schedule = torch.linspace(1, 0, nsteps).to(x)
                 x = self.integrate_flow_field(x, time_schedule, y, guidance)
+                x, _ = self.decode(x, y)
         return x  # noqa: F821, F722
+
+    def integration_step(
+        self,
+        x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+        t_curr: Float[Tensor, "batch"],  # noqa: F821, typing 
+        t_next: Float[Tensor, "batch"],  # noqa: F821, typing
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
+        guidance: float = 1.0
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
+        dt = t_next - t_curr
+
+        # Heun method
+        # First step - Euler
+        v1 = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
+        x_euler = x + dt * v1
+
+        # Second step - correction
+        v2 = self.get_flow_field(x_euler, t_next, y=y, guidance=guidance)
+        return x + dt * (v1 + v2) / 2
 
     def integrate_flow_field(
         self,
@@ -197,22 +270,12 @@ class SIModule(lightning.LightningModule):
         self.model.eval()
         if return_history:
             history = [(time_schedule[0], x)]
+
         for i in range(len(time_schedule) - 1):
-            t_curr = time_schedule[i]
-            t_next = time_schedule[i + 1]
-            dt = t_next - t_curr
+            t_curr = time_schedule[i] * torch.ones(x.shape[0]).to(x)
+            t_next = time_schedule[i + 1] * torch.ones(x.shape[0]).to(x)
 
-            t_curr = t_curr * (torch.ones(x.shape[0]).to(x))
-            t_next = t_next * (torch.ones(x.shape[0]).to(x))
-
-            # Heun method
-            # First step - Euler
-            v1 = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
-            x_euler = x + dt * v1
-
-            # Second step - correction
-            v2 = self.get_flow_field(x_euler, t_next, y=y, guidance=guidance)
-            x = x + dt * (v1 + v2) / 2
+            x = self.integration_step(x, t_curr, t_next, y, guidance)
 
             if return_history:
                 history.append((time_schedule[i + 1], x))

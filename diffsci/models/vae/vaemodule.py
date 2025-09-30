@@ -762,6 +762,30 @@ class DiagonalGaussianDistribution(torch.nn.Module):
                 dim=dims)
         return result
 
+    def kl_thresholded(
+        self,
+        other: "DiagonalGaussianDistribution | None" = None,
+        reduce_mean: bool = False,
+        threshold: float = 0.5
+    ):
+        dims = list(range(2, len(self.mean.shape)))
+        if not reduce_mean:
+            raise NotImplementedError("kl_thresholded only supports reduce_mean=True")
+        reduce_operator = torch.mean if reduce_mean else torch.sum
+        if other is None:
+            result = 0.5 * reduce_operator((torch.pow(self.mean, 2)
+                                            + self.var - 1.0 - self.logvar),
+                                           dim=dims)
+        else:  # Other is the unit Gaussian
+            result = 0.5 * reduce_operator(
+                torch.pow(self.mean - other.mean, 2) / other.var
+                + self.var / other.var - 1.0 - self.logvar + other.logvar,
+                dim=dims)
+        
+        threshold = threshold * torch.ones((result.shape[0], 1)).to(result)
+        result = torch.maximum(result, threshold)
+        return result
+
     def nll(self, sample: Float[Tensor, "batch zdim *shape"], reduce_mean: bool = False):  # noqa: F821, F722
         logtwopi = math.log(2.0 * math.pi)
         # Sum over all dimensions except batch dimension

@@ -190,6 +190,40 @@ class GaussianFourierProjection(torch.nn.Module):
         return x_proj
 
 
+class GeneralizedFourierProjection(torch.nn.Module):
+    def __init__(self, embed_dim, sample_distribution, scale=30.0):
+        """
+        Parameters
+        ----------
+        embed_dim : int
+            The dimension of the embedding
+        scale : float
+            The scale of the gaussian distribution
+        """
+        super().__init__()
+        self.register_buffer(
+            'W',
+            sample_distribution.sample([embed_dim // 2])*scale
+        )
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (...)
+
+        Returns
+        -------
+        x_proj : torch.Tensor of shape (..., embed_dim)
+        """
+        x = x[..., None]  # (..., 1)
+        x_proj = 2*math.pi*x*self.W  # (..., embed_dim//2)
+        x_proj = torch.cat(
+            [torch.sin(x_proj), torch.cos(x_proj)], dim=-1
+        )  # (..., embed_dim)
+        return x_proj
+
+
 class ConvolutionalFourierProjection(torch.nn.Module):
     def __init__(self,
                  input_dim,
@@ -235,6 +269,42 @@ class GaussianFourierProjectionVector(torch.nn.Module):
         self.input_dim = input_dim
         self.embed_dim = embed_dim
         W = torch.randn((input_dim, embed_dim//2))*scale
+        self.register_buffer('W',
+                             W)
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (..., input_dim)
+
+        Returns
+        -------
+        x_proj : torch.Tensor of shape (..., embed_dim)
+        """
+        x_proj = 2*math.pi*x@self.W  # (..., embed_dim//2)
+        x_proj = torch.cat(
+            [torch.sin(x_proj), torch.cos(x_proj)], dim=-1
+        )  # (..., embed_dim)
+        return x_proj
+
+
+class GeneralizedFourierProjectionVector(torch.nn.Module):
+    def __init__(self, input_dim, embed_dim, sample_distribution, scale=30.0):
+        """
+        Parameters
+        ----------
+        input_dim : int
+            The dimension of the input
+        embed_dim : int
+            The dimension of the embedding
+        scale : float
+            The scale of the gaussian distribution
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        W = sample_distribution.sample([input_dim, embed_dim//2])*scale
         self.register_buffer('W',
                              W)
 
@@ -619,6 +689,167 @@ class ResnetBlockB(torch.nn.Module):
         if self.has_residual_connection:
             y = y + x
         return y
+
+
+class ResnetBlockC(torch.nn.Module):
+    def __init__(self, input_channels,
+                 time_embed_dim,
+                 output_channels=None,
+                 dimension=2,
+                 kernel_size=3,
+                 dropout=0.0,
+                 first_norm="GroupLN",
+                 second_norm="GroupRMS",
+                 affine_norm=True,
+                 convolution_type="default",
+                 bias=True,
+                 extra_residual: None | torch.nn.Module = None):
+        """
+        Parameters
+        ----------
+        input_channels : int
+            The number of input channels
+        time_embed_dim : int | None
+            The dimension of the time embedding. If None,
+            then no time embedding is used.
+        output_channels : int | None
+            The number of output channels. If None,
+            then output_channels = input_channels
+        kernel_size : int
+            Size of convolutional kernel.
+        dropout : float
+            The dropout value
+        first_norm : str
+            The normalization layer to use after the first convolution.
+            Default: "GroupLN"
+        second_norm : str
+            The normalization layer to use after the second convolution.
+            Default: "GroupRMS"
+        affine_norm : bool
+            Whether to apply an learnable affine transformation
+            to the normalization
+        convolution_type : str
+            The type of convolution to use. Default: "default"
+        extra_residual:
+
+        """
+        super().__init__()
+        kernel_size = kernel_size
+        if output_channels is None:
+            output_channels = input_channels
+            self.has_residual_connection = True
+        else:
+            self.has_residual_connection = False
+        self.act = torch.nn.SiLU()
+        self.dimension = dimension
+        self.convolution_type = convolution_type
+        self.first_norm = first_norm
+        self.second_norm = second_norm
+
+        self.has_time_embed = time_embed_dim is not None
+
+        gnorm1_fn, gnorm2_fn = self.get_normalization_functions()
+
+        self.gnorm1 = gnorm1_fn(input_channels,
+                                input_channels,
+                                affine=affine_norm)
+
+        self.gnorm2 = gnorm2_fn(output_channels,
+                                output_channels,
+                                affine=affine_norm)
+
+        convfunc = self.get_convolution_function()
+        self.conv1 = convfunc(
+            input_channels,
+            output_channels,
+            kernel_size,
+            padding="same",
+            bias=bias
+        )
+        self.conv2 = convfunc(
+            output_channels,
+            output_channels,
+            kernel_size,
+            padding="same",
+            bias=bias
+        )
+
+        self.dropout = torch.nn.Dropout(p=dropout)
+
+        if convolution_type == "mp":
+            magnitude_preserving = True
+        else:
+            magnitude_preserving = False
+
+        if self.has_time_embed:
+            self.timeblock = ResnetTimeBlock(
+                time_embed_dim,
+                output_channels,
+                dimension=dimension,
+                magnitude_preserving=magnitude_preserving
+            )
+
+        self.extra_residual = extra_residual
+
+    def forward(self, x, te=None):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, input_channels, D, H, W)
+        te : torch.Tensor of shape (B, time_embed_dim)
+
+        Returns
+        -------
+        torch.Tensor of shape (B, output_channels, D, H, W)
+        """
+        # x : (B, C_in, D, H, W)
+        # te : (B, C_embed)
+        if te is None:
+            assert not self.has_time_embed
+        y = self.conv1(self.act(self.gnorm1(x)))  # (B, C_out, D, H, W)
+        if self.has_time_embed:
+            yt = self.timeblock(te)
+            y = y + yt  # (B, C_out, D, H, W)
+        y = self.conv2(
+            self.dropout(self.act((self.gnorm2(y))))
+        )  # (B, C_out, D, H, W)
+        if self.has_residual_connection:
+            y = y + x
+        if self.extra_residual is not None:
+            y = y + self.extra_residual(x)
+        return y
+
+    def get_convolution_function(self):
+        if self.convolution_type == "default":
+            return torch.nn.Conv2d if self.dimension == 2 else torch.nn.Conv3d
+        elif self.convolution_type == "circular":
+            return CircularConv2d if self.dimension == 2 else CircularConv3d
+        elif self.convolution_type == "mp":
+            return (normedlayers.MagnitudePreservingConv2d
+                    if self.dimension == 2
+                    else normedlayers.MagnitudePreservingConv3d)
+        else:
+            raise ValueError(
+                f"Invalid convolution type: {self.convolution_type}")
+
+    def get_normalization_functions(self):
+        if self.first_norm == "GroupLN":
+            gnorm1 = torch.nn.GroupNorm
+        elif self.first_norm == "GroupRMS":
+            gnorm1 = GroupRMSNorm
+        elif self.first_norm == "GroupPix":
+            gnorm1 = GroupPixNorm
+        else:
+            gnorm1 = torch.nn.Identity
+        if self.second_norm == "GroupLN":
+            gnorm2 = torch.nn.GroupNorm
+        elif self.second_norm == "GroupRMS":
+            gnorm2 = GroupRMSNorm
+        elif self.second_norm == "GroupPix":
+            gnorm2 = GroupPixNorm
+        else:
+            gnorm2 = torch.nn.Identity
+        return gnorm1, gnorm2
 
 
 class ResnetBlockC(torch.nn.Module):
