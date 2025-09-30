@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Callable, Any
 from jaxtyping import Float
 from torch import Tensor
 
@@ -10,7 +10,7 @@ import numpy as np
 import lightning
 
 from diffsci.torchutils import broadcast_from_below, dict_unsqueeze, dict_to
-from diffsci.models.aux_scripts import DimensionAgnosticBatchNorm, IdentityBatchNorm, HyperparameterManager
+from diffsci.models.aux_scripts import DimensionAgnosticBatchNorm, IdentityBatchNorm
 
 
 SampleType = Float[Tensor, "batch *shape"]
@@ -18,18 +18,118 @@ ConditionType = Float[Tensor, "batch *yshape"]
 TimeType = Float[Tensor, "batch"]
 
 
+class SIScheduler(object):
+    def __init__(
+        self,
+        alpha_fn: Callable[[float], float],
+        sigma_fn: Callable[[float], float],
+        alpha_fn_dot: Callable[[float], float],
+        sigma_fn_dot: Callable[[float], float],
+        sigma_fn_inv: Callable[[float], float]
+    ):
+        self.alpha_fn = alpha_fn
+        self.sigma_fn = sigma_fn
+        self.alpha_fn_dot = alpha_fn_dot
+        self.sigma_fn_dot = sigma_fn_dot
+        self.sigma_fn_inv = sigma_fn_inv
+
+    @classmethod
+    def linear(cls):
+        return cls(
+            alpha_fn=lambda t: 1 - t,
+            sigma_fn=lambda t: t,
+            alpha_fn_dot=lambda t: -1 * torch.ones_like(t),
+            sigma_fn_dot=lambda t: torch.ones_like(t),
+            sigma_fn_inv=lambda s: s,
+        )
+
+    @classmethod
+    def cosine(cls):
+        return cls(
+            alpha_fn=lambda t: torch.cos(t * np.pi / 2),
+            sigma_fn=lambda t: torch.sin(t * np.pi / 2),
+            alpha_fn_dot=lambda t: -1 * torch.pi / 2 * torch.sin(t * np.pi / 2),
+            sigma_fn_dot=lambda t: torch.pi / 2 * torch.cos(t * np.pi / 2),
+            sigma_fn_inv=lambda s: (2 / np.pi) * torch.arcsin(s),
+        )
+
+    @classmethod
+    def finterpolation(
+        cls,
+        f: Callable[[float], float],
+        finv: Callable[[float], float],
+        fdot: Callable[[float], float],
+        sigma_min: float,
+        sigma_max: float
+    ):
+        def sigma_fn(t):
+            interpolated_sigma = (1 - t) * finv(sigma_min) + t * finv(sigma_max)
+            return f(interpolated_sigma)
+
+        def sigma_fn_inv(s):
+            return (finv(s) - finv(sigma_min)) / (finv(sigma_max) - finv(sigma_min))
+
+        def sigma_fn_dot(t):
+            interpolated_sigma = (1 - t) * finv(sigma_min) + t * finv(sigma_max)
+            return fdot(interpolated_sigma) * (finv(sigma_max) - finv(sigma_min))
+
+        return cls(
+            alpha_fn=lambda t: 0.0 * t + 1.0,
+            sigma_fn=sigma_fn,
+            alpha_fn_dot=lambda t: 0.0 * t,
+            sigma_fn_dot=sigma_fn_dot,
+            sigma_fn_inv=sigma_fn_inv,
+        )
+
+    @classmethod
+    def edm(
+        cls,
+        expoent: float = 7.0,
+        sigma_min: float = 0.02,
+        sigma_max: float = 80.0
+    ):
+        f = lambda x: x**expoent  # noqa: E731
+        finv = lambda x: x**(1 / expoent)  # noqa: E731
+        fdot = lambda x: expoent * x**(expoent - 1)  # noqa: E731
+        return cls.finterpolation(f, finv, fdot, sigma_min, sigma_max)
+
+    @classmethod
+    def get_interpolator(cls, name, *args, **kwargs):
+        if name not in cls.named_interpolators():
+            raise ValueError(f"Invalid interpolator: {name}")
+        if name == 'linear':
+            return cls.linear(*args, **kwargs)
+        elif name == 'cosine':
+            return cls.cosine(*args, **kwargs)
+        elif name == 'edm':
+            return cls.edm(*args, **kwargs)
+        elif name == 'finterpolation':
+            return cls.finterpolation(*args, **kwargs)
+
+    @classmethod
+    def named_interpolators(cls):
+        return ['linear', 'cosine', 'edm', 'finterpolation']
+
+
 class SIModuleConfig(torch.nn.Module):
     def __init__(self,
-                 scheduler: Literal['linear', 'cosine'] = 'linear',
+                 scheduler: SIScheduler | str = 'linear',
+                 scheduler_args: dict[str, Any] = {},
                  num_channels: int | None = None,
                  initial_norm: bool = False,
+                 autonomous_flow: bool = False,
                  loss_metric: Literal['mse', 'huber'] = 'huber',
                  autoencoder_is_conditional: bool = False,
                  encode_condition: bool = False):
         super().__init__()
+        if isinstance(scheduler, str):
+            scheduler = SIScheduler.get_interpolator(scheduler, **scheduler_args)
+        else:
+            scheduler = scheduler
         self.scheduler = scheduler
         self.num_channels = num_channels
         self.initial_norm = initial_norm
+        self.autonomous_flow = autonomous_flow
         self.loss_metric = loss_metric
         self.autoencoder_is_conditional = autoencoder_is_conditional
         self.encode_condition = encode_condition
@@ -37,18 +137,11 @@ class SIModuleConfig(torch.nn.Module):
         self.set_loss_metric_module()
 
     def set_scheduling_functions(self):
-        if self.scheduler == 'linear':
-            self.alpha_fn = lambda t: 1 - t  # noqa
-            self.sigma_fn = lambda t: t  # noqa
-            self.alpha_fn_dot = lambda t: -1 * torch.ones_like(t)  # noqa
-            self.sigma_fn_dot = lambda t: torch.ones_like(t)  # noqa
-        elif self.scheduler == 'cosine':
-            self.alpha_fn = lambda t: torch.cos(t * np.pi / 2)  # noqa
-            self.sigma_fn = lambda t: torch.sin(t * np.pi / 2)  # noqa
-            self.alpha_fn_dot = lambda t: -1 * torch.pi / 2 * torch.sin(t * np.pi / 2)  # noqa
-            self.sigma_fn_dot = lambda t: torch.pi / 2 * torch.cos(t * np.pi / 2)  # noqa
-        else:
-            raise ValueError(f"Invalid scheduler: {self.scheduler}")
+        self.alpha_fn = self.scheduler.alpha_fn
+        self.sigma_fn = self.scheduler.sigma_fn
+        self.alpha_fn_dot = self.scheduler.alpha_fn_dot
+        self.sigma_fn_dot = self.scheduler.sigma_fn_dot
+        self.sigma_fn_inv = self.scheduler.sigma_fn_inv
 
     def set_loss_metric_module(self):
         if self.loss_metric == 'mse':
