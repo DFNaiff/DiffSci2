@@ -130,7 +130,7 @@ class Preconditioner(object):
     def get_flow_field(self, model, x, t=None, y=None):
         if self.precondition_fn is None:
             v = self.identity(model, x, t, y)
-        if isinstance(self.precondition_fn, str):
+        elif isinstance(self.precondition_fn, str):
             if self.precondition_fn == 'identity':
                 v = self.identity(model, x, t, y)
             elif self.precondition_fn == 'edm':
@@ -213,13 +213,13 @@ class LossWeighting(object):
         return torch.rand(nsamples)
 
     def edm_weighting_function(self, t):
-        return self.uniform_weighting_function(t)
-        # sigma = self.scheduler.sigma_fn(t)
-        # sigma_dot = self.scheduler.sigma_fn_dot(t)
-        # sigma_data = self.kwargs.get("sigma_data", 1.0)
-        # lambd = (sigma_data**2 + sigma**2) / (sigma * sigma_data**2)
-        # weight = lambd * sigma_dot**2 / sigma**2
-        # return weight
+        # return self.uniform_weighting_function(t)
+        sigma = self.scheduler.sigma_fn(t)
+        sigma_dot = self.scheduler.sigma_fn_dot(t)
+        sigma_data = self.kwargs.get("sigma_data", 1.0)
+        lambd = (sigma_data**2 + sigma**2) / ((sigma * sigma_data)**2)
+        weight = lambd * sigma_dot**2 / sigma**2
+        return weight
     
     def edm_weighting_sampler(self, nsamples):
         pmean = self.kwargs.get("pmean", -1.2)
