@@ -129,19 +129,20 @@ class Preconditioner(object):
 
     def get_flow_field(self, model, x, t=None, y=None):
         if self.precondition_fn is None:
-            return self.identity(model, x, t, y)
+            v = self.identity(model, x, t, y)
         if isinstance(self.precondition_fn, str):
             if self.precondition_fn == 'identity':
-                return self.identity(model, x, t, y)
+                v = self.identity(model, x, t, y)
             elif self.precondition_fn == 'edm':
-                return self.edm(model, x, t, y)
+                v = self.edm(model, x, t, y)
             else:
                 raise ValueError(f"Invalid condition function: {self.precondition_fn}")
         else:
             if self.is_autonomous:
-                return self.precondition_fn(model, x, y=y)
+                v = self.precondition_fn(model, x, y=y)
             else:
-                return self.precondition_fn(model, x, t, y=y)
+                v = self.precondition_fn(model, x, t, y=y)
+        return v
 
     def identity(self, model, x, t=None, y=None):
         if self.is_autonomous:
@@ -163,6 +164,7 @@ class Preconditioner(object):
         else:
             cnoise = 0.5 * torch.log(self.scheduler.sigma_fn(t))
             denoiser = cskip * x + cout * model(cin * x, cnoise, y=y)
+
             flow_field = sigma_dot / sigma * (x - denoiser)
         return flow_field
 
@@ -434,7 +436,8 @@ class SIModule(lightning.LightningModule):
             x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
             t: Float[Tensor, "batch"],  # noqa: F821, typing
             guidance: float = 1.0,
-            y: None | Float[Tensor, "*yshape"] = None  # noqa: F821, typing
+            y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing,
+            integrate_on_sigma: bool = False
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
         if guidance == 1.0 or y is None:  # Implictly no guidance
             flow_field = self.config.preconditioner(self.model, x_noised, t, y=y)
@@ -442,6 +445,9 @@ class SIModule(lightning.LightningModule):
             flow_field = self.config.preconditioner(self.model, x_noised, t, y=y)
             unconditioned_flow_field = self.config.preconditioner(self.model, x_noised, t, y=None)
             flow_field = guidance * flow_field + (1 - guidance) * unconditioned_flow_field
+        if integrate_on_sigma:
+            sigma_dot = self.config.sigma_fn_dot(t)
+            flow_field = flow_field / sigma_dot
         return flow_field
 
     def sample(self,
@@ -450,7 +456,8 @@ class SIModule(lightning.LightningModule):
                y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
                guidance: float = 1.0,
                nsteps: int = 30,
-               is_latent_shape: bool = False
+               is_latent_shape: bool = False,
+               integrate_on_sigma: bool = False
                ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
         if torch.inference_mode():
             with torch.no_grad():
@@ -465,36 +472,11 @@ class SIModule(lightning.LightningModule):
                 if y is not None:
                     y = dict_unsqueeze(y, 0)
                 time_schedule = torch.linspace(1, 0, nsteps).to(x)
-                x = self.integrate_flow_field(x, time_schedule, y, guidance)
+                sigma_init = self.config.sigma_fn(time_schedule[0])
+                x = x * sigma_init
+                x = self.integrate_flow_field(x, time_schedule, y, guidance, integrate_on_sigma=integrate_on_sigma)
                 x, _ = self.decode(x, y)
         return x  # noqa: F821, F722
-
-    def integration_step(
-        self,
-        x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
-        t_curr: Float[Tensor, "batch"],  # noqa: F821, typing 
-        t_next: Float[Tensor, "batch"],  # noqa: F821, typing
-        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
-        guidance: float = 1.0,
-        method: Literal['euler', 'heun'] = 'euler'
-    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
-        dt = t_next - t_curr
-
-        # Euler method
-        if method == 'euler':
-            v = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
-            return x + dt * v
-        elif method == 'heun':
-            # Heun method
-            # First step - Euler
-            v1 = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
-            x_euler = x + dt * v1
-
-            # Second step - correction
-            v2 = self.get_flow_field(x_euler, t_next, y=y, guidance=guidance)
-            return x + dt * (v1 + v2) / 2
-        else:
-            raise ValueError(f"Invalid integration method: {method}")
 
     def integrate_flow_field(
         self,
@@ -502,7 +484,8 @@ class SIModule(lightning.LightningModule):
         time_schedule: Float[Tensor, "nsteps"],  # noqa: F821, typing
         y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
         guidance: float = 1.0,
-        return_history: bool = False
+        return_history: bool = False,
+        integrate_on_sigma: bool = False
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
         # Integrate the flow field x' = v(x, t) using the Heun method
         self.model.eval()
@@ -514,7 +497,15 @@ class SIModule(lightning.LightningModule):
             t_next = time_schedule[i + 1] * torch.ones(x.shape[0]).to(x)
             method = 'euler' if i == len(time_schedule)-2 else 'heun'
 
-            x = self.integration_step(x, t_curr, t_next, y, guidance, method=method)
+            x = self.integration_step(
+                x,
+                t_curr,
+                t_next,
+                y,
+                guidance,
+                method=method,
+                integrate_on_sigma=integrate_on_sigma
+            )
 
             if return_history:
                 history.append((time_schedule[i + 1], x))
@@ -525,3 +516,35 @@ class SIModule(lightning.LightningModule):
         else:
             history = list(map(lambda tx: (tx[0], self.initial_norm.unnorm(tx[1])), history))
             return history
+
+    def integration_step(
+        self,
+        x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+        t_curr: Float[Tensor, "batch"],  # noqa: F821, typing 
+        t_next: Float[Tensor, "batch"],  # noqa: F821, typing
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
+        guidance: float = 1.0,
+        method: Literal['euler', 'heun'] = 'euler',
+        integrate_on_sigma: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
+
+        if not integrate_on_sigma:
+            dt = t_next - t_curr
+        else:
+            dt = self.config.sigma_fn(t_next) - self.config.sigma_fn(t_curr)
+
+        # Euler method
+        if method == 'euler':
+            v = self.get_flow_field(x, t_curr, y=y, guidance=guidance, integrate_on_sigma=integrate_on_sigma)
+            return x + dt * v
+        elif method == 'heun':
+            # Heun method
+            # First step - Euler
+            v1 = self.get_flow_field(x, t_curr, y=y, guidance=guidance, integrate_on_sigma=integrate_on_sigma)
+            x_euler = x + dt * v1
+
+            # Second step - correction
+            v2 = self.get_flow_field(x_euler, t_next, y=y, guidance=guidance, integrate_on_sigma=integrate_on_sigma)
+            return x + dt * (v1 + v2) / 2
+        else:
+            raise ValueError(f"Invalid integration method: {method}")
