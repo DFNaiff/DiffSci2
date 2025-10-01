@@ -63,15 +63,15 @@ class SIScheduler(object):
         sigma_max: float
     ):
         def sigma_fn(t):
-            interpolated_sigma = (1 - t) * finv(sigma_min) + t * finv(sigma_max)
-            return f(interpolated_sigma)
+            interpolated_finv_sigma = (1 - t) * finv(sigma_min) + t * finv(sigma_max)
+            return f(interpolated_finv_sigma)
 
         def sigma_fn_inv(s):
             return (finv(s) - finv(sigma_min)) / (finv(sigma_max) - finv(sigma_min))
 
         def sigma_fn_dot(t):
-            interpolated_sigma = (1 - t) * finv(sigma_min) + t * finv(sigma_max)
-            return fdot(interpolated_sigma) * (finv(sigma_max) - finv(sigma_min))
+            interpolated_finv_sigma = (1 - t) * finv(sigma_min) + t * finv(sigma_max)
+            return fdot(interpolated_finv_sigma) * (finv(sigma_max) - finv(sigma_min))
 
         return cls(
             alpha_fn=lambda t: 0.0 * t + 1.0,
@@ -111,6 +111,124 @@ class SIScheduler(object):
         return ['linear', 'cosine', 'edm', 'finterpolation']
 
 
+class Preconditioner(object):
+    def __init__(
+        self,
+        scheduler: SIScheduler,
+        precondition_fn: Literal['identity', 'edm'] | Callable | None = 'identity',
+        is_autonomous: bool = False,
+        **kwargs
+    ):
+        self.scheduler = scheduler
+        self.precondition_fn = precondition_fn
+        self.is_autonomous = is_autonomous
+        self.kwargs = kwargs
+
+    def __call__(self, model, x, t=None, y=None):
+        return self.get_flow_field(model, x, t, y)
+
+    def get_flow_field(self, model, x, t=None, y=None):
+        if self.precondition_fn is None:
+            return self.identity(model, x, t, y)
+        if isinstance(self.precondition_fn, str):
+            if self.precondition_fn == 'identity':
+                return self.identity(model, x, t, y)
+            elif self.precondition_fn == 'edm':
+                return self.edm(model, x, t, y)
+            else:
+                raise ValueError(f"Invalid condition function: {self.precondition_fn}")
+        else:
+            if self.is_autonomous:
+                return self.precondition_fn(model, x, y=y)
+            else:
+                return self.precondition_fn(model, x, t, y=y)
+
+    def identity(self, model, x, t=None, y=None):
+        if self.is_autonomous:
+            return model(x, y=y)
+        else:
+            return model(x, t, y=y)
+
+    def edm(self, model, x, t=None, y=None):
+        sigma_data = self.kwargs.get("sigma_data", 0.5)
+        sigma = self.scheduler.sigma_fn(t)
+        sigma_dot = self.scheduler.sigma_fn_dot(t)
+        sigma = broadcast_from_below(sigma, x)
+        sigma_dot = broadcast_from_below(sigma_dot, x)
+        cin = 1 / torch.sqrt(sigma_data**2 + sigma**2)
+        cout = sigma * sigma_data / torch.sqrt(sigma_data**2 + sigma**2)
+        cskip = sigma_data ** 2 / (sigma_data**2 + sigma**2)
+        if self.is_autonomous:
+            flow_field = cskip * x + cout * model(x / cin, y=y)
+        else:
+            cnoise = 0.5 * torch.log(self.scheduler.sigma_fn(t))
+            denoiser = cskip * x + cout * model(cin * x, cnoise, y=y)
+            # flow_field = sigma_dot / sigma * (x - denoiser)
+            flow_field = 1 / sigma * (x - denoiser)  # TODO: Remove
+        return flow_field
+
+
+class LossWeighting(object):
+    def __init__(
+        self,
+        scheduler: SIScheduler,
+        weighting_class: Literal['edm', 'uniform'] | dict[str, Any] = 'uniform',
+        **kwargs
+    ):
+        self.scheduler = scheduler
+        self.kwargs = kwargs
+        self.weighting_class = weighting_class
+
+        if not isinstance(weighting_class, str):
+            assert 'weighting_function' in weighting_class
+            assert 'weighting_sampler' in weighting_class
+
+    def weighting_function(self, t):
+        if isinstance(self.weighting_class, str):
+            if self.weighting_class == 'edm':
+                return self.edm_weighting_function(t)
+            elif self.weighting_class == 'uniform':
+                return self.uniform_weighting_function(t)
+            else:
+                raise ValueError(f"Invalid weighting class: {self.weighting_class}")
+        else:
+            return self.weighting_class['weighting_function'](t)
+
+    def weighting_sampler(self, nsamples):
+        if isinstance(self.weighting_class, str):
+            if self.weighting_class == 'edm':
+                return self.edm_weighting_sampler(nsamples)
+            elif self.weighting_class == 'uniform':
+                return self.uniform_weighting_sampler(nsamples)
+            else:
+                raise ValueError(f"Invalid weighting class: {self.weighting_class}")
+        else:
+            return self.weighting_class['weighting_sampler'](nsamples)
+
+    def uniform_weighting_function(self, t):
+        return 1.0 + 0.0 * t
+    
+    def uniform_weighting_sampler(self, nsamples):
+        return torch.rand(nsamples)
+
+    def edm_weighting_function(self, t):
+        return self.uniform_weighting_function(t)
+        # sigma = self.scheduler.sigma_fn(t)
+        # sigma_dot = self.scheduler.sigma_fn_dot(t)
+        # sigma_data = self.kwargs.get("sigma_data", 1.0)
+        # lambd = (sigma_data**2 + sigma**2) / (sigma * sigma_data**2)
+        # weight = lambd * sigma_dot**2 / sigma**2
+        # return weight
+    
+    def edm_weighting_sampler(self, nsamples):
+        pmean = self.kwargs.get("pmean", -1.2)
+        pstd = self.kwargs.get("pstd", 1.2)
+        logsigma = pstd * torch.randn(nsamples) + pmean
+        sigma = torch.exp(logsigma)
+        t = self.scheduler.sigma_fn_inv(sigma)
+        return t
+
+
 class SIModuleConfig(torch.nn.Module):
     def __init__(self,
                  scheduler: SIScheduler | str = 'linear',
@@ -118,6 +236,8 @@ class SIModuleConfig(torch.nn.Module):
                  num_channels: int | None = None,
                  initial_norm: bool = False,
                  autonomous_flow: bool = False,
+                 precondition_fn: Callable | str | None = None,
+                 loss_weighting: Literal['edm', 'uniform'] | dict[str, Any] = 'uniform',
                  loss_metric: Literal['mse', 'huber'] = 'huber',
                  autoencoder_is_conditional: bool = False,
                  encode_condition: bool = False):
@@ -130,11 +250,15 @@ class SIModuleConfig(torch.nn.Module):
         self.num_channels = num_channels
         self.initial_norm = initial_norm
         self.autonomous_flow = autonomous_flow
+        self.loss_weighting = loss_weighting
         self.loss_metric = loss_metric
+        self.precondition_fn = precondition_fn
         self.autoencoder_is_conditional = autoencoder_is_conditional
         self.encode_condition = encode_condition
         self.set_scheduling_functions()
         self.set_loss_metric_module()
+        self.set_preconditioner()
+        self.set_loss_weighting()
 
     def set_scheduling_functions(self):
         self.alpha_fn = self.scheduler.alpha_fn
@@ -151,6 +275,15 @@ class SIModuleConfig(torch.nn.Module):
         else:
             raise ValueError(f"Invalid loss metric: {self.loss_metric}")
 
+    def set_preconditioner(self):
+        self.preconditioner = Preconditioner(self.scheduler, self.precondition_fn, self.autonomous_flow)
+
+    def set_loss_weighting(self):
+        if isinstance(self.loss_weighting, str):
+            self.loss_weighting = LossWeighting(self.scheduler, self.loss_weighting)
+        else:
+            self.loss_weighting = LossWeighting(self.scheduler, **self.loss_weighting)
+
 
 class SIModule(lightning.LightningModule):
     def __init__(
@@ -166,7 +299,7 @@ class SIModule(lightning.LightningModule):
         self.autoencoder = autoencoder
         if self.autoencoder:
             self.freeze_autoencoder()
-
+    
     def freeze_autoencoder(self):
         """
         Freezes the autoencoder to prevent its weights from being updated
@@ -215,12 +348,15 @@ class SIModule(lightning.LightningModule):
         t_broadcasted = broadcast_from_below(t, x)
         alpha, sigma = self.config.alpha_fn(t_broadcasted), self.config.sigma_fn(t_broadcasted)
         x_noised = alpha * x + sigma * noise
-        flow_field = self.model(x_noised, t, y=y)
+        flow_field = self.get_flow_field(x_noised, t, y=y, guidance=1.0)
 
         alpha_dot, sigma_dot = self.config.alpha_fn_dot(t_broadcasted), self.config.sigma_fn_dot(t_broadcasted)
         target = (alpha_dot * x + sigma_dot * noise)
 
         loss = self.config.loss_metric_module(flow_field, target)
+        loss_weighting = self.config.loss_weighting.weighting_function(t_broadcasted)
+        loss = loss * loss_weighting
+
         if mask is not None:
             # Apply the mask if it is provided
             # We assume that the mask is 1 where the data is absent
@@ -231,7 +367,7 @@ class SIModule(lightning.LightningModule):
 
     def sample_timestep(self, nsamples):
         # Sample from uniform 0 and 1
-        t = torch.rand(nsamples)
+        t = self.config.loss_weighting.weighting_sampler(nsamples)
         return t
 
     def training_step(self, batch, batch_idx):
@@ -302,9 +438,11 @@ class SIModule(lightning.LightningModule):
             y: None | Float[Tensor, "*yshape"] = None  # noqa: F821, typing
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
         if guidance == 1.0 or y is None:  # Implictly no guidance
-            flow_field = self.model(x_noised, t, y=y)
+            flow_field = self.config.preconditioner(self.model, x_noised, t, y=y)
         else:
-            flow_field = guidance * self.model(x_noised, t, y=y) + (1 - guidance) * self.model(x_noised, t, y=None)
+            flow_field = self.config.preconditioner(self.model, x_noised, t, y=y)
+            unconditioned_flow_field = self.config.preconditioner(self.model, x_noised, t, y=None)
+            flow_field = guidance * flow_field + (1 - guidance) * unconditioned_flow_field
         return flow_field
 
     def sample(self,
@@ -338,18 +476,26 @@ class SIModule(lightning.LightningModule):
         t_curr: Float[Tensor, "batch"],  # noqa: F821, typing 
         t_next: Float[Tensor, "batch"],  # noqa: F821, typing
         y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
-        guidance: float = 1.0
+        guidance: float = 1.0,
+        method: Literal['euler', 'heun'] = 'euler'
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
         dt = t_next - t_curr
 
-        # Heun method
-        # First step - Euler
-        v1 = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
-        x_euler = x + dt * v1
+        # Euler method
+        if method == 'euler':
+            v = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
+            return x + dt * v
+        elif method == 'heun':
+            # Heun method
+            # First step - Euler
+            v1 = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
+            x_euler = x + dt * v1
 
-        # Second step - correction
-        v2 = self.get_flow_field(x_euler, t_next, y=y, guidance=guidance)
-        return x + dt * (v1 + v2) / 2
+            # Second step - correction
+            v2 = self.get_flow_field(x_euler, t_next, y=y, guidance=guidance)
+            return x + dt * (v1 + v2) / 2
+        else:
+            raise ValueError(f"Invalid integration method: {method}")
 
     def integrate_flow_field(
         self,
@@ -367,8 +513,9 @@ class SIModule(lightning.LightningModule):
         for i in range(len(time_schedule) - 1):
             t_curr = time_schedule[i] * torch.ones(x.shape[0]).to(x)
             t_next = time_schedule[i + 1] * torch.ones(x.shape[0]).to(x)
+            method = 'euler' if i == len(time_schedule)-2 else 'heun'
 
-            x = self.integration_step(x, t_curr, t_next, y, guidance)
+            x = self.integration_step(x, t_curr, t_next, y, guidance, method=method)
 
             if return_history:
                 history.append((time_schedule[i + 1], x))
