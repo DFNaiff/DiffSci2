@@ -163,8 +163,7 @@ class Preconditioner(object):
         else:
             cnoise = 0.5 * torch.log(self.scheduler.sigma_fn(t))
             denoiser = cskip * x + cout * model(cin * x, cnoise, y=y)
-            # flow_field = sigma_dot / sigma * (x - denoiser)
-            flow_field = 1 / sigma * (x - denoiser)  # TODO: Remove
+            flow_field = sigma_dot / sigma * (x - denoiser)
         return flow_field
 
 
