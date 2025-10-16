@@ -53,8 +53,8 @@ class VAEModuleConfig:
                  kl_weight: float = 1e-3,
                  nll_weight: float = 1.0,
                  logvar_init: float = 0.0,
-                 trainable_logvar: bool = True,
-                 reduce_mean: bool = False,
+                 trainable_logvar: bool = False,
+                 reduce_mean: bool = True,
                  teacher_encdec: torch.nn.Module | None = None,
                  teaching_mode: TeachingMode = "both",
                  distillation_alpha: float = 0.5,
@@ -566,8 +566,13 @@ class VAEModule(lightning.LightningModule):
 
     def log_images_to_tensorboard(self, x, x_recon, batch_idx, max_images=4):
         # Only log up to max_images
-        x = x[:max_images]
-        x_recon = x_recon[:max_images]
+        # Take first slice if 5D tensor, otherwise keep as is
+        if x.dim() == 5:
+            x = x[:max_images, ..., 0]
+            x_recon = x_recon[:max_images, ..., 0]
+        else:
+            x = x[:max_images]
+            x_recon = x_recon[:max_images]
         # Assume images are [B, C, H, W] and in range [0, 1] or [0, 255]
         # If not, normalize as needed
         grid = torch.cat([x, x_recon], dim=0)  # Stack originals and reconstructions

@@ -208,19 +208,19 @@ class LossWeighting(object):
 
     def uniform_weighting_function(self, t):
         return 1.0 + 0.0 * t
-    
+
     def uniform_weighting_sampler(self, nsamples):
         return torch.rand(nsamples)
 
     def edm_weighting_function(self, t):
-        # return self.uniform_weighting_function(t)
-        sigma = self.scheduler.sigma_fn(t)
-        sigma_dot = self.scheduler.sigma_fn_dot(t)
-        sigma_data = self.kwargs.get("sigma_data", 1.0)
-        lambd = (sigma_data**2 + sigma**2) / ((sigma * sigma_data)**2)
-        weight = lambd * sigma_dot**2 / sigma**2
-        return weight
-    
+        return self.uniform_weighting_function(t)
+        # sigma = self.scheduler.sigma_fn(t)
+        # sigma_dot = self.scheduler.sigma_fn_dot(t)
+        # sigma_data = self.kwargs.get("sigma_data", 1.0)
+        # lambd = (sigma_data**2 + sigma**2) / ((sigma * sigma_data)**2)
+        # weight = lambd * sigma_dot**2 / sigma**2
+        # return weight
+
     def edm_weighting_sampler(self, nsamples):
         pmean = self.kwargs.get("pmean", -1.2)
         pstd = self.kwargs.get("pstd", 1.2)
@@ -300,7 +300,7 @@ class SIModule(lightning.LightningModule):
         self.autoencoder = autoencoder
         if self.autoencoder:
             self.freeze_autoencoder()
-    
+
     def freeze_autoencoder(self):
         """
         Freezes the autoencoder to prevent its weights from being updated
@@ -320,6 +320,8 @@ class SIModule(lightning.LightningModule):
             raise ValueError("Cannot encode condition if autoencoder is not conditional")
         else:
             x, y = self.autoencoder.encode(x, y)
+        if isinstance(x, dict):  # Handle the case where the autoencoder returns a dict
+            x = x['zsample']
         return x, y
 
     def decode(self, x, y=None):
@@ -501,7 +503,8 @@ class SIModule(lightning.LightningModule):
                nsteps: int = 30,
                is_latent_shape: bool = False,
                integrate_on_sigma: bool = False,
-               noise_injection: bool = False
+               noise_injection: bool = False,
+               return_latents: bool = False
                ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
         if torch.inference_mode():
             with torch.no_grad():
@@ -525,7 +528,8 @@ class SIModule(lightning.LightningModule):
                     guidance,
                     integrate_on_sigma=integrate_on_sigma,
                     noise_injection=noise_injection)
-                x, _ = self.decode(x, y)
+                if not return_latents:
+                    x, _ = self.decode(x, y)
         return x  # noqa: F821, F722
 
     def integrate_flow_field(
@@ -550,7 +554,7 @@ class SIModule(lightning.LightningModule):
             if noise_injection:
                 method = 'euler_maruyama'
             else:
-                method = 'euler' if i == len(time_schedule)-2 else 'heun'
+                method = 'euler' if i == len(time_schedule) - 2 else 'heun'
 
             x = self.integration_step(
                 x,
@@ -576,7 +580,7 @@ class SIModule(lightning.LightningModule):
     def integration_step(
         self,
         x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
-        t_curr: Float[Tensor, "batch"],  # noqa: F821, typing 
+        t_curr: Float[Tensor, "batch"],  # noqa: F821, typing
         t_next: Float[Tensor, "batch"],  # noqa: F821, typing
         y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
         guidance: float = 1.0,
