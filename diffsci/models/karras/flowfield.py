@@ -450,6 +450,49 @@ class SIModule(lightning.LightningModule):
             flow_field = flow_field / sigma_dot
         return flow_field
 
+    def get_score_field(
+        self,
+        x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+        t: Float[Tensor, "batch"],  # noqa: F821, typing
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
+        guidance: float = 1.0,
+        integrate_on_sigma: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
+        flow_field = self.get_flow_field(x_noised, t, y=y, guidance=guidance, integrate_on_sigma=integrate_on_sigma)
+        (alpha, sigma, alpha_dot, sigma_dot) = (
+            self.config.alpha_fn(t),
+            self.config.sigma_fn(t),
+            self.config.alpha_fn_dot(t),
+            self.config.sigma_fn_dot(t)
+        )
+        alpha = broadcast_from_below(alpha, x_noised)
+        sigma = broadcast_from_below(sigma, x_noised)
+        alpha_dot = broadcast_from_below(alpha_dot, x_noised)
+        sigma_dot = broadcast_from_below(sigma_dot, x_noised)
+        score_field = ((alpha * flow_field - alpha_dot * x_noised) /
+                       (sigma * (alpha_dot * sigma - alpha * sigma_dot)))
+        return score_field
+
+    def get_score_field_from_flow_field(
+        self,
+        flow_field: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+        x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+        t: Float[Tensor, "batch"],  # noqa: F821, typing
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
+        (alpha, sigma, alpha_dot, sigma_dot) = (
+            self.config.alpha_fn(t),
+            self.config.sigma_fn(t),
+            self.config.alpha_fn_dot(t),
+            self.config.sigma_fn_dot(t)
+        )
+        alpha = broadcast_from_below(alpha, flow_field)
+        sigma = broadcast_from_below(sigma, flow_field)
+        alpha_dot = broadcast_from_below(alpha_dot, flow_field)
+        sigma_dot = broadcast_from_below(sigma_dot, flow_field)
+        score_field = ((alpha * flow_field - alpha_dot * x_noised) /
+                       (sigma * (alpha_dot * sigma - alpha * sigma_dot)))
+        return score_field
+
     def sample(self,
                nsamples: int,
                shape: list[int],
@@ -457,7 +500,8 @@ class SIModule(lightning.LightningModule):
                guidance: float = 1.0,
                nsteps: int = 30,
                is_latent_shape: bool = False,
-               integrate_on_sigma: bool = False
+               integrate_on_sigma: bool = False,
+               noise_injection: bool = False
                ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
         if torch.inference_mode():
             with torch.no_grad():
@@ -474,7 +518,13 @@ class SIModule(lightning.LightningModule):
                 time_schedule = torch.linspace(1, 0, nsteps).to(x)
                 sigma_init = self.config.sigma_fn(time_schedule[0])
                 x = x * sigma_init
-                x = self.integrate_flow_field(x, time_schedule, y, guidance, integrate_on_sigma=integrate_on_sigma)
+                x = self.integrate_flow_field(
+                    x,
+                    time_schedule,
+                    y,
+                    guidance,
+                    integrate_on_sigma=integrate_on_sigma,
+                    noise_injection=noise_injection)
                 x, _ = self.decode(x, y)
         return x  # noqa: F821, F722
 
@@ -485,7 +535,8 @@ class SIModule(lightning.LightningModule):
         y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
         guidance: float = 1.0,
         return_history: bool = False,
-        integrate_on_sigma: bool = False
+        integrate_on_sigma: bool = False,
+        noise_injection: bool = False
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
         # Integrate the flow field x' = v(x, t) using the Heun method
         self.model.eval()
@@ -495,7 +546,11 @@ class SIModule(lightning.LightningModule):
         for i in range(len(time_schedule) - 1):
             t_curr = time_schedule[i] * torch.ones(x.shape[0]).to(x)
             t_next = time_schedule[i + 1] * torch.ones(x.shape[0]).to(x)
-            method = 'euler' if i == len(time_schedule)-2 else 'heun'
+
+            if noise_injection:
+                method = 'euler_maruyama'
+            else:
+                method = 'euler' if i == len(time_schedule)-2 else 'heun'
 
             x = self.integration_step(
                 x,
@@ -504,7 +559,8 @@ class SIModule(lightning.LightningModule):
                 y,
                 guidance,
                 method=method,
-                integrate_on_sigma=integrate_on_sigma
+                integrate_on_sigma=integrate_on_sigma,
+                noise_injection=noise_injection
             )
 
             if return_history:
@@ -524,16 +580,21 @@ class SIModule(lightning.LightningModule):
         t_next: Float[Tensor, "batch"],  # noqa: F821, typing
         y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
         guidance: float = 1.0,
-        method: Literal['euler', 'heun'] = 'euler',
-        integrate_on_sigma: bool = False
+        method: Literal['euler', 'heun', 'euler_maruyama'] = 'euler',
+        integrate_on_sigma: bool = False,
+        noise_injection: bool = False
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
 
         if not integrate_on_sigma:
             dt = t_next - t_curr
         else:
             dt = self.config.sigma_fn(t_next) - self.config.sigma_fn(t_curr)
+        dt = broadcast_from_below(dt, x)
 
         # Euler method
+        if method in ['euler', 'heun']:
+            assert not noise_injection, "Noise injection is not supported for Euler and Heun methods"
+
         if method == 'euler':
             v = self.get_flow_field(x, t_curr, y=y, guidance=guidance, integrate_on_sigma=integrate_on_sigma)
             return x + dt * v
@@ -546,5 +607,16 @@ class SIModule(lightning.LightningModule):
             # Second step - correction
             v2 = self.get_flow_field(x_euler, t_next, y=y, guidance=guidance, integrate_on_sigma=integrate_on_sigma)
             return x + dt * (v1 + v2) / 2
+        elif method == 'euler_maruyama':
+            if not noise_injection:
+                raise ValueError("Noise injection is required for Euler-Maruyama method")
+            v = self.get_flow_field(x, t_curr, y=y, guidance=guidance, integrate_on_sigma=integrate_on_sigma)
+            score_field = self.get_score_field_from_flow_field(v, x, t_curr)
+            omega = self.config.sigma_fn(t_curr)  # TODO: Allow for more complex integration methods
+            omega = broadcast_from_below(omega, x)
+            x = x + dt * (v - 0.5 * omega * score_field)
+            noise = torch.sqrt(omega * torch.abs(dt)) * torch.randn_like(x)
+            x = x + noise
+            return x
         else:
             raise ValueError(f"Invalid integration method: {method}")
