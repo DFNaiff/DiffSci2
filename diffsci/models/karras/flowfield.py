@@ -504,11 +504,17 @@ class SIModule(lightning.LightningModule):
                is_latent_shape: bool = False,
                integrate_on_sigma: bool = False,
                noise_injection: bool = False,
-               return_latents: bool = False
+               return_latents: bool = False,
+               orig_noise: Float[Tensor, "batch *shape"] | None = None  # noqa: F821, typing
                ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, F722
         if torch.inference_mode():
             with torch.no_grad():
-                x = torch.randn(nsamples, *shape).to(self.device)
+                if orig_noise is None:
+                    x = torch.randn(nsamples, *shape).to(self.device)
+                else:
+                    assert orig_noise.shape[0] == nsamples, "Number of samples must match"
+                    assert list(orig_noise.shape[1:]) == list(shape), "Shape of noise must match"
+                    x = orig_noise.to(self.device)
                 if y is not None:
                     warnings.warn("Moving y to device: {}".format(self.device))
                     y = dict_to(y, self.device)
