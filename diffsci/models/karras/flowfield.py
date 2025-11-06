@@ -1,5 +1,5 @@
 from typing import Literal, Callable, Any
-from jaxtyping import Float
+from jaxtyping import Float, Bool
 from torch import Tensor
 
 import warnings
@@ -531,6 +531,57 @@ class SIModule(lightning.LightningModule):
                 if not return_latents:
                     x, _ = self.decode(x, y)
         return x  # noqa: F821, F722
+
+    def inpaint(
+        self,
+        x_orig: Float[Tensor, "*shape"],  # noqa: F821, typing,
+        mask: Float[Tensor, "*shape"],  # noqa: F821, typing,
+        nsamples: int = 1,
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
+        guidance: float = 1.0,
+        nsteps: int = 30,
+        integrate_on_sigma: bool = False,
+        noise_injection: bool = False,
+        orig_noise: Float[Tensor, "batch *shape"] | None = None  # noqa: F821, typing
+    ) -> Float[Tensor, "batch *shape"]:  # noqa F821, typing
+        # mask: 1 for where data is present, 0 for where data is absent
+        warnings.warn("We are assuming we are in latent space for inpainting")
+        with torch.inference_mode():
+            with torch.no_grad():
+                x_orig = x_orig.to(self.device)
+                mask = mask.to(self.device)
+                shape = x_orig.shape
+                x_orig = x_orig.unsqueeze(0)
+                x_orig = self.initial_norm(x_orig)
+                if orig_noise is None:
+                    x = torch.randn(nsamples, *shape).to(self.device)
+                else:
+                    assert orig_noise.shape[0] == nsamples, "Number of samples must match"
+                    assert orig_noise.shape[1:] == shape, "Shape of noise must match"
+                    x = orig_noise.to(self.device)
+                time_schedule = torch.linspace(1, 0, nsteps).to(x)
+                sigma_init = self.config.sigma_fn(time_schedule[0])
+                x = x * sigma_init
+                for i in range(len(time_schedule) - 1):
+                    t_curr = time_schedule[i] * torch.ones(x.shape[0]).to(x)
+                    t_next = time_schedule[i + 1] * torch.ones(x.shape[0]).to(x)
+                    x = self.integration_step(
+                        x,
+                        t_curr,
+                        t_next,
+                        y,
+                        guidance,
+                        method='euler_maruyama',
+                        integrate_on_sigma=integrate_on_sigma,
+                        noise_injection=True
+                    )
+                    sigma = broadcast_from_below(self.config.sigma_fn(t_next), x_orig)
+                    alpha = broadcast_from_below(self.config.alpha_fn(t_next), x_orig)
+
+                    x_patch = alpha * x_orig + sigma * torch.randn_like(x_orig)
+                    x = (1 - mask) * x + mask * x_patch
+                x = self.initial_norm.unnorm(x)
+                return x
 
     def integrate_flow_field(
         self,

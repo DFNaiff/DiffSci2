@@ -8,7 +8,7 @@ from .punetg_config import PUNetGConfig
 
 
 class PUNetG(torch.nn.Module):
-    
+
     """
     PUNetG is a UNet-style generative model for probabilistic generation task.
 
