@@ -4,6 +4,8 @@ from torch import Tensor
 import torch
 import numpy as np
 
+from diffsci.torchutils import periodic_getitem, periodic_setitem
+
 
 def _get_grid_generation_order(grid_map: list[int]) -> tuple[list[tuple[int, int, int]], int]:
     """
@@ -124,12 +126,12 @@ def _get_grid_generation_order(grid_map: list[int]) -> tuple[list[tuple[int, int
     return positions, corner_inds_limit
 
 
-
 def _get_cube_spatial_bounds(
     grid_pos: tuple[int, int, int],
     base_shape: list[int],
     overlap_size: int,
-    final_shape: list[int]
+    final_shape: list[int],
+    periodicity: list[bool] = [False, False, False]
 ) -> tuple[slice, slice, slice]:
     """
     Computes spatial bounds for a cube at grid position (i, j, k).
@@ -162,12 +164,24 @@ def _get_cube_spatial_bounds(
     end_z = start_z + extended_size[2]
 
     # Clamp to volume boundaries
-    start_x = max(0, start_x)
-    start_y = max(0, start_y)
-    start_z = max(0, start_z)
-    end_x = min(final_size[0], end_x)
-    end_y = min(final_size[1], end_y)
-    end_z = min(final_size[2], end_z)
+    if not periodicity[0]:
+        start_x = max(0, start_x)
+        end_x = min(final_size[0], end_x)
+    else:
+        start_x = start_x % final_size[0]
+        end_x = end_x % final_size[0]
+    if not periodicity[1]:
+        start_y = max(0, start_y)
+        end_y = min(final_size[1], end_y)
+    else:
+        start_y = start_y % final_size[1]
+        end_y = end_y % final_size[1]
+    if not periodicity[2]:
+        start_z = max(0, start_z)
+        end_z = min(final_size[2], end_z)
+    else:
+        start_z = start_z % final_size[2]
+        end_z = end_z % final_size[2]
 
     return (slice(start_x, end_x), slice(start_y, end_y), slice(start_z, end_z))
 
@@ -177,7 +191,8 @@ def _build_inpaint_mask(
     generated_positions: set[tuple[int, int, int]],
     base_shape: list[int],
     overlap_size: int,
-    final_shape: list[int]
+    final_shape: list[int],
+    periodicity: list[bool] = [False, False, False]
 ) -> torch.Tensor:
     """
     Creates mask for inpainting at current position.
@@ -189,69 +204,66 @@ def _build_inpaint_mask(
         base_shape: [channels, dx, dy, dz] - base cube shape
         overlap_size: overlap between cubes
         final_shape: [channels, final_dx, final_dy, final_dz] - final volume shape
+        periodicity: [periodic_x, periodic_y, periodic_z] - whether each dimension wraps around
 
     Returns:
         Mask tensor of shape [channels, extended_size, extended_size, extended_size]
         where 1 indicates known data, 0 indicates unknown
     """
     # Get spatial bounds for current cube
-    current_bounds = _get_cube_spatial_bounds(grid_pos, base_shape, overlap_size, final_shape)
+    current_bounds = _get_cube_spatial_bounds(grid_pos, base_shape, overlap_size, final_shape, periodicity)
     sx, sy, sz = current_bounds
 
-    # Compute extended size
-    extended_size = [s.stop - s.start for s in current_bounds]
+    # Extended size is base_size + overlap_size (not computed from bounds which may wrap)
+    base_size = base_shape[1:]
+    extended_size = [s + overlap_size for s in base_size]
 
-    # Initialize mask (all zeros = unknown)
-    mask = torch.zeros((base_shape[0], extended_size[0], extended_size[1], extended_size[2]))
+    # Create a temporary volume to mark all previously generated regions
+    # This approach handles periodicity correctly by using periodic_setitem
+    # Create on CPU - will be moved to device by caller if needed
+    temp_volume = torch.zeros(final_shape)
 
-    # For each previously generated position, mark overlap regions
+    # Mark all previously generated regions as 1 in temp_volume
     for prev_pos in generated_positions:
-        prev_bounds = _get_cube_spatial_bounds(prev_pos, base_shape, overlap_size, final_shape)
+        prev_bounds = _get_cube_spatial_bounds(prev_pos, base_shape, overlap_size, final_shape, periodicity)
         psx, psy, psz = prev_bounds
+        
+        # Create a cube of ones with the same shape as the previous cube
+        # Extended size is base_size + overlap_size (same for all cubes)
+        ones_cube = torch.ones((base_shape[0], extended_size[0], extended_size[1], extended_size[2]))
+        
+        # Mark this region in temp_volume using periodic_setitem
+        periodic_setitem(temp_volume, ones_cube, slice(None), psx, psy, psz)
 
-        # Find intersection region
-        intersect_x_start = max(sx.start, psx.start)
-        intersect_x_end = min(sx.stop, psx.stop)
-        intersect_y_start = max(sy.start, psy.start)
-        intersect_y_end = min(sy.stop, psy.stop)
-        intersect_z_start = max(sz.start, psz.start)
-        intersect_z_end = min(sz.stop, psz.stop)
-
-        # If there's an intersection
-        if (intersect_x_start < intersect_x_end and
-            intersect_y_start < intersect_y_end and
-            intersect_z_start < intersect_z_end):  # noqa: E129
-
-            # Convert to local coordinates in current cube
-            local_x_start = intersect_x_start - sx.start
-            local_x_end = intersect_x_end - sx.start
-            local_y_start = intersect_y_start - sy.start
-            local_y_end = intersect_y_end - sy.start
-            local_z_start = intersect_z_start - sz.start
-            local_z_end = intersect_z_end - sz.start
-
-            # Set mask to 1 in intersection region
-            mask[:, local_x_start:local_x_end, local_y_start:local_y_end, local_z_start:local_z_end] = 1.0
+    # Extract the mask for current cube from temp_volume using periodic_getitem
+    mask = periodic_getitem(temp_volume, slice(None), sx, sy, sz)
+    
+    # Clamp mask to [0, 1] in case of overlaps (should already be 0 or 1, but just in case)
+    mask = torch.clamp(mask, 0, 1)
 
     return mask
 
 
-def _extract_noise_slice(
-    noise_cube: torch.Tensor,
-    spatial_bounds: tuple[slice, slice, slice]
+def _extract_wrapped_index(
+    tensor: torch.Tensor,
+    spatial_bounds: tuple[slice, slice, slice],
 ) -> torch.Tensor:
     """
-    Extracts noise slice from big noise cube using spatial bounds.
+    Extracts a slice from tensor with wrapping support for periodic dimensions.
+    Generalization of: subvolume = cube[:, sx, sy, sz]
 
     Args:
-        noise_cube: Big noise tensor of shape [channels, final_dx, final_dy, final_dz]
-        spatial_bounds: Tuple of 3 slice objects
+        tensor: Input tensor of shape [channels, dx, dy, dz]
+        spatial_bounds: Tuple of 3 slice objects (sx, sy, sz)
+        final_shape: [channels, final_dx, final_dy, final_dz] - shape of the full volume
+        periodicity: [periodic_x, periodic_y, periodic_z] - whether each dimension wraps around
 
     Returns:
-        Noise slice tensor of appropriate shape
+        Extracted slice tensor with wrapping applied where needed
     """
+    # TODO: Use torchutils.periodic_getitem
     sx, sy, sz = spatial_bounds
-    return noise_cube[:, sx, sy, sz]
+    return periodic_getitem(tensor, slice(None), sx, sy, sz)
 
 
 def _combine_cube_into_volume(
@@ -276,41 +288,7 @@ def _combine_cube_into_volume(
 
     if blend_mode == 'latest':
         # Simply overwrite
-        volume[:, sx, sy, sz] = cube
-    elif blend_mode == 'cosine':
-        # Cosine blending in overlap regions
-        existing = volume[:, sx, sy, sz]
-
-        # Compute distance from cube center for blending weights
-        cube_shape = cube.shape[1:]  # [dx, dy, dz]
-        center = [s // 2 for s in cube_shape]
-
-        # Create coordinate grids
-        coords = torch.meshgrid(
-            torch.arange(cube_shape[0], device=cube.device),
-            torch.arange(cube_shape[1], device=cube.device),
-            torch.arange(cube_shape[2], device=cube.device),
-            indexing='ij'
-        )
-
-        # Compute distances from center
-        dist_x = torch.abs(coords[0] - center[0]).float()
-        dist_y = torch.abs(coords[1] - center[1]).float()
-        dist_z = torch.abs(coords[2] - center[2]).float()
-
-        # Normalize distances by half the cube size
-        max_dist = max(cube_shape) / 2.0
-        dist_norm = torch.sqrt(dist_x**2 + dist_y**2 + dist_z**2) / max_dist
-
-        # Cosine weighting: w = 0.5 * (1 + cos(π * d)) where d is normalized distance
-        # At center (d=0): w=1 (use new value)
-        # At edge (d=1): w=0 (use old value)
-        weight = 0.5 * (1 + torch.cos(np.pi * dist_norm))
-        weight = weight.unsqueeze(0)  # Add channel dimension
-
-        # Blend
-        blended = weight * cube + (1 - weight) * existing
-        volume[:, sx, sy, sz] = blended
+        periodic_setitem(volume, cube, slice(None), sx, sy, sz)
     else:
         raise ValueError(f"Unknown blend_mode: {blend_mode}")
 
@@ -328,6 +306,7 @@ def sample_grid_volume(
     integrate_on_sigma: bool = False,
     noise_injection: bool = False,
     blend_mode: Literal['latest', 'cosine'] = 'latest',
+    periodicity: list[bool] = [False, False, False],
     **kwargs
 ) -> Float[Tensor, "batch *final_shape"]:
     """
@@ -357,6 +336,11 @@ def sample_grid_volume(
         base_shape[3] * grid_map[2]
     ]
 
+    # Check whether true periodic dimensions are matched with even grid maps
+    for i in range(3):
+        if periodicity[i] and grid_map[i] % 2 != 0:
+            raise ValueError(f"Grid map for dimension {i} is not even, but periodicity is True")
+
     # Generate big noise cube of final shape
     device = flow_module.device
     noise_cube = torch.randn(1, *final_shape).to(device)
@@ -367,19 +351,17 @@ def sample_grid_volume(
     # Get generation order based on parity patterns
     generation_order, corner_inds_limit = _get_grid_generation_order(grid_map)
 
-    print(generation_order)
-    print(f"corner_inds_limit: {corner_inds_limit}")
     # Track generated positions
     generated_positions = set()
 
     # Generate cubes in order
     for grid_ind, grid_pos in enumerate(generation_order):
         # Compute spatial bounds for this cube
-        spatial_bounds = _get_cube_spatial_bounds(grid_pos, base_shape, overlap_size, final_shape)
+        spatial_bounds = _get_cube_spatial_bounds(grid_pos, base_shape, overlap_size, final_shape, periodicity)
         sx, sy, sz = spatial_bounds
 
         # Extract noise slice from big noise cube
-        noise_slice = _extract_noise_slice(noise_cube[0], spatial_bounds)  # Remove batch dim for extraction
+        noise_slice = _extract_wrapped_index(noise_cube[0], spatial_bounds)  # Remove batch dim for extraction
         noise_slice = noise_slice.unsqueeze(0)  # Add batch dim back
 
         # Get extended cube shape
@@ -407,13 +389,15 @@ def sample_grid_volume(
         else:
             # Use inpainting for edges/faces/centers
             # Build mask from previously generated cubes
+            # continue  # TODO: Remove, obviously, this is a test
+
             mask = _build_inpaint_mask(
-                grid_pos, generated_positions, base_shape, overlap_size, final_shape
+                grid_pos, generated_positions, base_shape, overlap_size, final_shape, periodicity
             )
             mask = mask.to(device)
 
             # Extract known regions from volume into x_orig
-            x_orig = volume[0, :, sx, sy, sz].clone()  # Remove batch dim for extraction
+            x_orig = periodic_getitem(volume[0], slice(None), sx, sy, sz)
 
             # Use inpainting
             generated_cube = flow_module.inpaint(
@@ -430,14 +414,15 @@ def sample_grid_volume(
             )
 
         # inpaint returns [batch, *shape], remove batch dim if needed
-        if generated_cube.dim() == len(cube_shape) + 1 and generated_cube.shape[0] == 1:
-            generated_cube = generated_cube[0]
-
+        # if generated_cube.dim() == len(cube_shape) + 1 and generated_cube.shape[0] == 1:
+            # generated_cube = generated_cube[0]
+        generated_cube = generated_cube[0]
         print('-------------------------------')
         print(grid_ind)
         print(grid_pos)
         print(spatial_bounds)
         print(volume.shape)
+        print(generated_cube.shape)
         print('--------------------------------')
         # Combine generated cube into volume
         volume = _combine_cube_into_volume(volume[0], generated_cube, spatial_bounds, blend_mode)

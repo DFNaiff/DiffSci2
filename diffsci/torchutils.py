@@ -90,7 +90,7 @@ def dict_to(d, device):
 def load_submodule(model, checkpoint_path, model_name="model"):
     checkpoint = torch.load(checkpoint_path)
     state_dict = checkpoint['state_dict']
-    
+
     # Create new state dict with modified keys
     new_state_dict = {}
     prefix = model_name + "."
@@ -98,7 +98,128 @@ def load_submodule(model, checkpoint_path, model_name="model"):
         if key.startswith(prefix):
             new_key = key[len(prefix):]  # Remove prefix
             new_state_dict[new_key] = value
-            
+
     # Load the modified state dict
     model.load_state_dict(new_state_dict)
     return model
+
+
+def periodic_getitem(tensor, *indices):
+    """Extract periodic slice from tensor with dimension-by-dimension wrapping.
+
+    Usage:
+        periodic_getitem(a, slice(7, 2), slice(None), slice(3, 1))
+        periodic_getitem(a, slice(7, 2))  # for 1D
+    """
+    if not indices:
+        return tensor
+
+    result = tensor
+    offset = 0  # track dimension offset as we squeeze integer indices
+
+    for dim_orig, idx in enumerate(indices):
+        dim = dim_orig - offset
+
+        if isinstance(idx, slice):
+            size = result.shape[dim]
+            start = idx.start if idx.start is not None else 0
+            stop = idx.stop if idx.stop is not None else size
+            step = idx.step if idx.step is not None else 1
+
+            if abs(start - stop) > size:
+                raise ValueError(f"Slice {idx} is too large for dimension {dim} with size {size}")
+            # Normalize negatives
+            start = start % size if start < 0 else start
+            stop = stop % size if stop < 0 else stop
+
+            # Normalize greater than size
+            start = start % size if start > size else start
+            stop = stop % size if stop > size else stop
+
+            if step == 1 and stop < start:
+                # Wrap around
+                tail = result.narrow(dim, start, size - start)
+                head = result.narrow(dim, 0, stop)
+                result = torch.cat([tail, head], dim=dim)
+            elif step == 1:
+                # Normal slice
+                result = result.narrow(dim, start, max(0, stop - start))
+            else:
+                # With step
+                raise NotImplementedError("Only step=1 supported in periodic_getitem")
+        else:
+            raise TypeError(f"Unsupported index type: {type(idx)}")
+
+    return result
+
+
+# Cleaner version without step support (since you said you don't need it)
+def periodic_setitem(tensor, value, *indices):
+    """Assign to periodic slice in tensor (in-place). Only supports step=1.
+
+    Args:
+        tensor: tensor to modify (in-place)
+        indices: tuple of slice objects (step must be None or 1)
+        value: values to assign
+
+    Usage:
+        periodic_setitem_simple(a, (slice(7, 2),), values)
+        periodic_setitem_simple(a, (slice(7, 2), slice(10, 3)), values)
+    """
+    if not isinstance(indices, tuple):
+        indices = (indices,)
+
+    # Analyze each dimension
+    dim_info = []
+    for dim, idx in enumerate(indices):
+        if not isinstance(idx, slice):
+            raise TypeError(f"Only slice indexing supported, got {type(idx)}")
+
+        size = tensor.shape[dim]
+        start = idx.start if idx.start is not None else 0
+        stop = idx.stop if idx.stop is not None else size
+        step = idx.step if idx.step is not None else 1
+
+        if abs(start - stop) > size:
+            raise ValueError(f"Slice {idx} is too large for dimension {dim} with size {size}")
+
+        if step != 1:
+            raise ValueError("Only step=1 supported in simple version")
+
+        # Normalize negatives
+        start = start % size if start < 0 else start
+        stop = stop % size if stop < 0 else stop
+
+        if stop < start:
+            # Wrapping: [start:] + [:stop]
+            n_tail = size - start
+            n_head = stop
+            dim_info.append([
+                (slice(start, size), slice(0, n_tail)),
+                (slice(0, stop), slice(n_tail, n_tail + n_head))
+            ])
+        else:
+            # Normal
+            n_elements = stop - start
+            dim_info.append([
+                (slice(start, stop), slice(0, n_elements))
+            ])
+
+    # Generate all combinations
+    _assign_combinations(tensor, value, dim_info, 0, [], [])
+
+
+def _assign_combinations(tensor, value, dim_info, current_dim, tensor_slices, value_slices):
+    """Recursively assign to all region combinations."""
+    if current_dim >= len(dim_info):
+        # Execute assignment
+        tensor[tuple(tensor_slices)] = value[tuple(value_slices)]
+        return
+
+    # Iterate through regions for current dimension
+    for tensor_slice, value_slice in dim_info[current_dim]:
+        _assign_combinations(
+            tensor, value, dim_info, current_dim + 1,
+            tensor_slices + [tensor_slice],
+            value_slices + [value_slice]
+        )

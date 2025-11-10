@@ -1,35 +1,34 @@
 # chunk_decode_strategy_b_3d.py
 # -----------------------------------------------------------------------------
 # General 3D chunked (tiled) decode for a VAEDecoder using Strategy B:
-# multi-stage, halo-propagating streaming with CPU stage buffers.
+# multi-stage, halo-propagating streaming with CPU stage buffers + periodic BCs.
 #
-# Key properties:
-#   - Works along ALL THREE spatial axes (latent dims D, H, W), i.e., you can
-#     chunk in any subset of directions. If a chunk is >= the axis length,
-#     we effectively "don't chunk" that axis.
-#   - Per-stage *sub-tiling* ensures that NO intermediate per-stage CUDA tensor
-#     exceeds your chosen cap (`max_stage_out_chunk`) in that stage's output units.
-#   - Exact results on tile centers (no approximations) for decoders with only
-#     local ops (no attention).
+# WHAT THIS FILE DOES (HIGH LEVEL):
+#   1) We decode a huge latent volume z_latent: [B, z_dim, H, W, D] through your decoder,
+#      but instead of running the full forward (which OOMs), we run it in tiles.
+#   2) We split the work into "stages" (S0 .. SN). Each stage is a contiguous chunk of
+#      decoder layers (S0 = post_quant+conv_in+mid, S1..S_{N-1} = each "up" stage, SN = final).
+#   3) For each stage, we build the stage output *piece-by-piece* on CPU: read the minimal
+#      input from the previous stage buffer with the required halo, run only this stage on GPU,
+#      crop the valid center from the stage output, write that center to a CPU tensor, free GPU.
+#   4) Periodicity (optional): when reading halos near boundaries, we wrap (like torus)
+#      using periodic_getitem, so the convolution sees correct neighbors.
 #
-# Tensor layout expected:
-#   z_latent: [B, z_dim, H, W, D]
-#      where D is the LAST dimension (consistent with PyTorch 3D convs).
-#   The code accepts chunk sizes as (D, H, W) in LATENT units — i.e., you give
-#   the chunk along the last, then the first, then the second spatial axis
-#   (to align terminology "Z,Y,X" = (D,H,W)).
+# WHY THIS IS EXACT (no approximation):
+#   - The decoder has only local ops (3x3, stride 1, upsample) → finite receptive field.
+#   - We compute the per-stage halo in LATENT units and *only* read that much at each stage.
+#   - The center we write is exactly what the full-volume forward would have produced there.
 #
-# Notation in this file:
-#   - "latent units": coordinates at the decoder's input (H,W,D) grid.
-#   - "source units": coordinates of the previous stage's output grid.
-#   - "dest units": coordinates of the current stage's output grid.
-#   - Scales are uniform across spatial axes: at stage s, total scale
-#     (relative to latent) is `dest_scale = scales_after[s]` (1,2,4,...).
+# TENSOR LAYOUT (VERY IMPORTANT):
+#   - Input z_latent is [B, z_dim, H, W, D]  (channels after batch, D last).
+#   - All spatial math below uses axis order (D, H, W) in function parameters where relevant,
+#     because chunk_latent is specified as (D, H, W). Internally, we always index
+#     z_latent as [..., H_slice, W_slice, D_slice].
 #
-# Assumptions:
-#   - Decoder has NO attention (attn_type='none', has_mid_attn=False).
-#   - Patch-based convs are effectively disabled (patch_size=None).
-#   - GroupNorm is used; with sufficient halos and center-cropping this is exact.
+# YOU'LL SEE MANY COMMENTS LIKE:
+#   - SHAPE: x  → explains tensor shapes at this line.
+#   - WHY:   x  → explains the reason behind a step (index mapping, halo choice, etc).
+#   - NOTE / TODO: things to double-check when you adapt this (e.g., periodic windows).
 #
 # -----------------------------------------------------------------------------
 
@@ -39,11 +38,16 @@ from typing import List, Tuple, Optional, Union
 from dataclasses import dataclass
 
 import torch
+from diffsci.torchutils import periodic_getitem, periodic_setitem  # setitem unused here (writes don't wrap)
 
 
 # ------------------------------- tiny helpers ------------------------------ #
 
 def _device_of(module: torch.nn.Module) -> torch.device:
+    """
+    Return a sensible device for 'module' (first parameter's device).
+    Fallback: cuda if available, else cpu.
+    """
     try:
         return next(module.parameters()).device
     except StopIteration:
@@ -51,6 +55,10 @@ def _device_of(module: torch.nn.Module) -> torch.device:
 
 
 def _dtype_of(module: torch.nn.Module) -> torch.dtype:
+    """
+    Return a sensible dtype for 'module' (first parameter's dtype).
+    Fallback: float32.
+    """
     try:
         return next(module.parameters()).dtype
     except StopIteration:
@@ -60,7 +68,9 @@ def _dtype_of(module: torch.nn.Module) -> torch.dtype:
 def _norm3(v: Union[int, Tuple[int, int, int], List[int]], *, name: str) -> Tuple[int, int, int]:
     """
     Normalize an int or 3-tuple/list to a 3-tuple of ints.
-    We use the ordering (D, H, W) to match z_latent's last three dims [H, W, D].
+    ORDERING CHOICE:
+      - We accept (D, H, W) to match typical "Z,Y,X" speak.
+      - Internally we always slice as [..., H, W, D], so keep this mapping in mind.
     """
     if isinstance(v, int):
         return (v, v, v)
@@ -70,26 +80,42 @@ def _norm3(v: Union[int, Tuple[int, int, int], List[int]], *, name: str) -> Tupl
     raise ValueError(f"{name} must be int or 3-tuple/list (D, H, W). Got: {v!r}")
 
 
+def _norm3_bool(v: Union[bool, Tuple[bool, bool, bool], List[bool]], *, name: str) -> Tuple[bool, bool, bool]:
+    """
+    Normalize a bool or 3-tuple/list of bools into (D, H, W).
+    Same ordering convention as _norm3.
+    """
+    if isinstance(v, bool):
+        return (v, v, v)
+    if isinstance(v, (tuple, list)) and len(v) == 3:
+        D, H, W = bool(v[0]), bool(v[1]), bool(v[2])
+        return (D, H, W)
+    raise ValueError(f"{name} must be bool or 3-tuple/list (D, H, W). Got: {v!r}")
+
+
 def _make_center_spans_1d(L: int, chunk: int, radius0: int) -> List[Tuple[int, int]]:
     """
-    Plan center spans along ONE axis in LATENT coords.
+    Decide the center spans along ONE axis (in LATENT units) for Stage-0 tiling.
 
-    Inputs:
-      - L: axis length in latent units (e.g., D=64 or H=32)
-      - chunk: desired chunk length including halos at Stage 0 (latent)
-      - radius0: Stage-0 halo (latent units)
+    INPUTS:
+      L       : axis length in latent units (e.g., D=64 or H=32)
+      chunk   : desired Stage-0 tile extent including halos (latent units)
+      radius0 : Stage-0 halo radius (latent)
 
-    Behavior:
-      - If chunk >= L  -> single span (0, L) => no tiling on this axis.
-      - Else           -> valid0 = max(1, chunk - 2*radius0); step by valid0 to cover [0, L).
+    RULES:
+      - If chunk >= L  → return [(0, L)]    (no tiling in that axis).
+      - Else:
+          valid0 = max(1, chunk - 2*radius0)    # center width inside each tile
+          then partition [0, L) by steps of 'valid0'.
 
-    Returns list of [cs, ce) center segments that partition [0,L) (last may be shorter).
+    RETURNS:
+      List of (cs, ce) pairs (LATENT coords) that partition [0, L).
     """
     if chunk >= L:
         return [(0, L)]
     valid0 = chunk - 2 * radius0
     if valid0 <= 0:
-        # Degenerate request: force at least 1 latent cell for the center step.
+        # If the requested chunk is too small (halo eats it), force 1 latent cell step.
         valid0 = 1
     spans = []
     pos = 0
@@ -104,51 +130,59 @@ def _make_center_spans_1d(L: int, chunk: int, radius0: int) -> List[Tuple[int, i
 
 def _compute_stage_radii_and_scales(decoder) -> Tuple[List[int], List[int]]:
     """
-    Radii (latent) and total output scales (relative to latent) after each stage.
+    For the given decoder, compute:
+      - radii_latent[s]  : floor( RF_after_finishing_stage_s / 2 ) in LATENT units
+      - scales_after[s]  : total spatial upsample factor (relative to latent)
+                           after stage s (e.g., 1,2,4,...,2^(N-1), same for final).
 
-    Stages (S0..SN):
-      - S0: post_quant_conv -> conv_in -> mid.block_1 -> (mid.attn?) -> mid.block_2
-      - S1..S_{N-1}: each up stage with upsample (deepest to shallowest)
-      - SN: final stage (up[0] blocks + norm_out + act + conv_out [+ tanh])
-
-    Returns:
-      radii_latent: floor(RF_after_stage / 2), length N+1
-      scales_after: [1,2,4,...,2^(N-1), 2^(N-1)]
+    WHY:
+      Strategy B depends on *stage-local* halos, which we get from differences
+      of cumulative radii (see below). Cumulative radii come from an RF analysis
+      of your architecture (encoder/decoder code already provides that).
     """
     cfg = decoder.config
-    # Guard: attention makes RF global → Strategy B requires approximation (not done here)
+
+    # IMPORTANT GUARD:
+    # This code assumes NO attention (global RF) in the decoder. If there is attention,
+    # exact tiling without approximation is not possible; you'd need long-range context.
     if cfg.has_mid_attn or (len(cfg.attn_resolutions) > 0):
         raise NotImplementedError("This chunked decoder assumes NO attention in the decoder.")
 
     info = decoder.calculate_receptive_field()
-    rf_per_block = int(info["rf_per_block"])   # 4 standard, 2 minimal
-    rf_mid = int(info["rf_after_middle"])
-    rf_final = int(info["rf_latent"])
+    rf_per_block = int(info["rf_per_block"])   # 4 for std blocks; 2 for minimal_rf blocks
+    rf_mid       = int(info["rf_after_middle"])
+    rf_final     = int(info["rf_latent"])
 
-    num_res = int(cfg.num_resolutions)
+    num_res        = int(cfg.num_resolutions)          # number of "up" modules
     num_res_blocks = int(cfg.num_res_blocks)
-    per_up_rf = (num_res_blocks + 1) * rf_per_block
+    per_up_rf      = (num_res_blocks + 1) * rf_per_block  # each up has (num_blocks+1) ResBlocks
 
-    # Radii after each stage (latent coords), floor(RF/2)
-    radii: List[int] = [rf_mid // 2]
-    for s in range(1, num_res):  # S1..S_{N-1}
+    # CUMULATIVE radii after each stage s:
+    radii: List[int] = [rf_mid // 2]                  # after S0
+    for s in range(1, num_res):                       # S1..S_{N-1}
         rf_s = rf_mid + per_up_rf * s
         radii.append(rf_s // 2)
-    radii.append(rf_final // 2)  # SN final
+    radii.append(rf_final // 2)                       # final stage SN
 
-    # Scales after each stage (total upsampling factor relative to latent)
+    # TOTAL SCALE (relative to latent) after each stage s:
     scales: List[int] = [1]
     for s in range(1, num_res):
-        scales.append(2 ** s)
-    scales.append(2 ** max(0, num_res - 1))
+        scales.append(2 ** s)                         # each "up" doubles spatial dims
+    scales.append(2 ** max(0, num_res - 1))           # final stage doesn't upsample more
 
     return radii, scales
 
 
 # ----------------------------- Stage runners ------------------------------- #
+# (These just peel off the exact pieces of the decoder to run per stage.)
 
 @torch.inference_mode()
 def _run_stage0(decoder, z: torch.Tensor, temb: Optional[torch.Tensor]) -> torch.Tensor:
+    """
+    RUNS: post_quant_conv -> conv_in -> mid.block_1 -> (mid.attn?) -> mid.block_2
+    INPUT SHAPE:  z: [B, z_dim, h, w, d]   (z at latent resolution)
+    OUTPUT SHAPE:   [B, C0,    h, w, d]
+    """
     h = decoder.post_quant_conv(z)
     h = decoder.conv_in(h)
     h = decoder.mid.block_1(h, temb)
@@ -160,6 +194,11 @@ def _run_stage0(decoder, z: torch.Tensor, temb: Optional[torch.Tensor]) -> torch
 
 @torch.inference_mode()
 def _run_up_stage(decoder, x: torch.Tensor, level_index: int, temb: Optional[torch.Tensor]) -> torch.Tensor:
+    """
+    RUNS: up[level_index].blocks (and atten if any) + (if level != 0) upsample x2
+    INPUT SHAPE:  x: [B, C_in, h, w, d]
+    OUTPUT SHAPE:   [B, C_out, h', w', d'] where (h',w',d') = (h,w,d) or doubled
+    """
     up = decoder.up[level_index]
     h = x
     for i in range(len(up.block)):
@@ -167,21 +206,25 @@ def _run_up_stage(decoder, x: torch.Tensor, level_index: int, temb: Optional[tor
         if len(up.attn) > i:
             h = up.attn[i](h)
     if level_index != 0:
-        h = up.upsample(h)  # ×2 in spatial dims (H, W, D)
+        h = up.upsample(h)  # doubles H,W,D
     return h
 
 
 @torch.inference_mode()
 def _run_final_stage(decoder, x: torch.Tensor, temb: Optional[torch.Tensor]) -> torch.Tensor:
+    """
+    RUNS: up[0].blocks -> norm_out -> swish -> conv_out -> (tanh if set)
+    INPUT SHAPE:  x: [B, C_in, h, w, d]
+    OUTPUT SHAPE:   [B, out_channels, h, w, d]
+    """
     up0 = decoder.up[0]
     h = x
     for i in range(len(up0.block)):
         h = up0.block[i](h, temb)
         if len(up0.attn) > i:
             h = up0.attn[i](h)
-    # swish
     h = decoder.norm_out(h)
-    h = h * torch.sigmoid(h)
+    h = h * torch.sigmoid(h)  # swish activation
     h = decoder.conv_out(h)
     if getattr(decoder.config, "tanh_out", False):
         h = torch.tanh(h)
@@ -192,8 +235,9 @@ def _run_final_stage(decoder, x: torch.Tensor, temb: Optional[torch.Tensor]) -> 
 
 class _CPUStageBuffer:
     """
-    CPU tensor buffer for the WHOLE output of a stage.
-    Shape: [B, C, Hs, Ws, Ds]   (stage coords; s = stage index)
+    A CPU tensor that holds the ENTIRE output of some stage.
+    SHAPE: [B, C, H_stage, W_stage, D_stage].
+    We fill it incrementally by writing the valid centers from tiles.
     """
     def __init__(self, shape: Tuple[int, int, int, int, int], dtype: torch.dtype):
         self.tensor = torch.zeros(shape, dtype=dtype, device="cpu")
@@ -204,30 +248,52 @@ class _CPUStageBuffer:
                     x0: int, x1: int,
                     tile: torch.Tensor):
         """
-        Write a block into [B,C,y0:y1, x0:x1, z0:z1] from 'tile' (any device).
-        'tile' must already be the VALID CENTER for this block.
+        Copy 'tile' into the destination coordinates.
+        EXPECTED tile shape: [B, C, (y1-y0), (x1-x0), (z1-z0)].
         """
         self.tensor[..., y0:y1, x0:x1, z0:z1].copy_(tile.detach().to("cpu"))
 
-    def read_block(self,
-                   z0: int, z1: int,
-                   y0: int, y1: int,
-                   x0: int, x1: int,
-                   device: torch.device,
-                   dtype: torch.dtype) -> torch.Tensor:
+    def read_block_periodic(
+        self,
+        z0: int, z1: int,
+        y0: int, y1: int,
+        x0: int, x1: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         """
-        Return [B,C,y0:y1, x0:x1, z0:z1] in the requested device/dtype.
+        Read a block from this stage with periodic wrapping.
+        - Indices z0:z1, y0:y1, x0:x1 MAY be outside [0, size). We wrap using periodic_getitem.
+        - We reshape [B, C, H, W, D] → [B*C, H, W, D] so "channels" are first.
+
+        RETURNS: [B, C, (y1-y0), (x1-x0), (z1-z0)] on 'device' with 'dtype'.
         """
-        return self.tensor[..., y0:y1, x0:x1, z0:z1].to(
-            device=device, dtype=dtype, non_blocking=False
-        ).contiguous()
+        B, C, Hs, Ws, Ds = self.tensor.shape
+
+        # SHAPE: [B*C, H, W, D]
+        flat = self.tensor.reshape(B * C, Hs, Ws, Ds)
+
+        # Build slices (possibly out-of-range). periodic_getitem will wrap.
+        sy = slice(y0, y1, None)  # H axis (second)
+        sx = slice(x0, x1, None)  # W axis (third)
+        sz = slice(z0, z1, None)  # D axis (fourth)
+
+        # WRAPPED FETCH on spatial dims (channels=first dim)
+        sub = periodic_getitem(flat, slice(None), sy, sx, sz)
+
+        # Back to [B, C, h, w, d]
+        sub = sub.reshape(B, C, sub.shape[1], sub.shape[2], sub.shape[3])
+        return sub.to(device=device, dtype=dtype, non_blocking=False).contiguous()
 
 
 # -------------------------- Configuration & Data structures ---------------- #
 
 @dataclass
 class ChunkDecodeConfig:
-    """Configuration for a chunked decode operation."""
+    """
+    Immutable configuration we compute once before running stages.
+    Keeps the tiling plan, radii, scales, periodic flags, etc.
+    """
     device: torch.device
     model_dtype: torch.dtype
     B: int
@@ -248,56 +314,54 @@ class ChunkDecodeConfig:
     capD: Optional[int]
     capH: Optional[int]
     capW: Optional[int]
+    periodicD: bool
+    periodicH: bool
+    periodicW: bool
     debug: bool
 
 
 @dataclass
 class SubTileRange:
-    """Represents a sub-tile range in latent coordinates."""
-    z0: int
-    z1: int
-    y0: int
-    y1: int
-    x0: int
-    x1: int
+    """
+    A sub-range (in LATENT units) INSIDE a center block.
+    We split a center block into sub-tiles if needed to keep stage tensors small.
+    """
+    z0: int; z1: int   # D axis in LATENT coords
+    y0: int; y1: int   # H axis in LATENT coords
+    x0: int; x1: int   # W axis in LATENT coords
 
 
 @dataclass
 class ReadWindow:
-    """Read window coordinates in both latent and source units."""
-    # Latent units
-    rsD_lat: int
-    reD_lat: int
-    rsH_lat: int
-    reH_lat: int
-    rsW_lat: int
-    reW_lat: int
-    # Source units
-    rsD_src: int
-    reD_src: int
-    rsH_src: int
-    reH_src: int
-    rsW_src: int
-    reW_src: int
+    """
+    A read window for fetching input to a stage.
+    - *_lat are in LATENT units (may be outside 0..L if periodic).
+    - *_src are the same window scaled into the SOURCE grid (prev stage).
+    """
+    # Latent (possibly out-of-range if periodic)
+    rsD_lat: int; reD_lat: int
+    rsH_lat: int; reH_lat: int
+    rsW_lat: int; reW_lat: int
+    # Source (prev-stage) coords (just multiply by src_scale)
+    rsD_src: int; reD_src: int
+    rsH_src: int; reH_src: int
+    rsW_src: int; reW_src: int
 
 
 @dataclass
 class TileCropCoords:
-    """Coordinates for cropping and writing a tile."""
+    """
+    How to crop the stage tile output (y_tile) to its valid center, and where
+    to place that center inside the destination CPU stage buffer.
+    """
     # Tile offsets (where to crop from y_tile)
-    yD_start: int
-    yD_end: int
-    yH_start: int
-    yH_end: int
-    yW_start: int
-    yW_end: int
-    # Global write coords (where to write in dest buffer)
-    gD0: int
-    gD1: int
-    gH0: int
-    gH1: int
-    gW0: int
-    gW1: int
+    yD_start: int; yD_end: int
+    yH_start: int; yH_end: int
+    yW_start: int; yW_end: int
+    # Global write coords in DESTINATION stage buffer
+    gD0: int; gD1: int
+    gH0: int; gH1: int
+    gW0: int; gW1: int
 
 
 # -------------------------- Setup & Helper Functions ----------------------- #
@@ -308,41 +372,44 @@ def _setup_chunk_decode_config(
     chunk_latent: Union[int, Tuple[int, int, int], List[int]],
     device: Optional[Union[str, torch.device]],
     max_stage_out_chunk: Optional[Union[int, Tuple[int, int, int], List[int]]],
+    periodicity: Union[bool, Tuple[bool, bool, bool], List[bool]],
     debug: bool
 ) -> ChunkDecodeConfig:
-    """Extract and compute all configuration for chunked decode."""
+    """
+    Gather all static info for the run (shapes, radii, scales, spans, caps, flags).
+    """
+    # Resolve device/dtype
     if device is None:
         device = _device_of(decoder)
     else:
         device = torch.device(device)
-
     model_dtype = _dtype_of(decoder)
 
+    # SHAPE: z_latent = [B, z_dim, H, W, D]
     assert z_latent.dim() == 5, "z_latent must be [B, z_dim, H, W, D]"
     B, zC, H, W, D = z_latent.shape
 
+    # Normalize chunk sizes and periodic flags (in (D, H, W) order).
     chD, chH, chW = _norm3(chunk_latent, name="chunk_latent")
+    perD, perH, perW = _norm3_bool(periodicity, name="periodicity")
 
-    if debug:
-        print(f"chunk_latent: {chD}, {chH}, {chW}")
-        print(f"z_latent.shape: {z_latent.shape}")
-
+    # Stage cumulative radii & scales
     radii_latent, scales_after = _compute_stage_radii_and_scales(decoder)
-    num_res = int(decoder.config.num_resolutions)
-    num_stages = num_res + 1
+    num_res    = int(decoder.config.num_resolutions)
+    num_stages = num_res + 1  # S0..SN
 
-    # Compute stage-local radii
+    # STAGE-LOCAL radii (what each stage adds) in LATENT units:
     delta_r_lat = []
     for s in range(num_stages):
         prev = radii_latent[s - 1] if s > 0 else 0
         delta_r_lat.append(max(0, radii_latent[s] - prev))
 
-    # Plan center spans
+    # Stage-0 center spans per axis:
     spans_D = _make_center_spans_1d(D, chD, radii_latent[0])
     spans_H = _make_center_spans_1d(H, chH, radii_latent[0])
     spans_W = _make_center_spans_1d(W, chW, radii_latent[0])
 
-    # Parse caps
+    # Per-stage output caps (to avoid large y_tile tensors). Normalize to (D,H,W) in DEST units.
     if max_stage_out_chunk is None:
         capD, capH, capW = None, None, None
     else:
@@ -350,13 +417,14 @@ def _setup_chunk_decode_config(
         capD, capH, capW = int(cD), int(cH), int(cW)
 
     if debug:
-        print(f"Latent HW D: H={H}, W={W}, D={D}")
+        print(f"Latent H,W,D: H={H}, W={W}, D={D}")
         print("radii_latent =", radii_latent)
         print("delta_r_lat  =", delta_r_lat)
         print("scales_after =", scales_after)
         print("spans_D =", spans_D)
         print("spans_H =", spans_H)
         print("spans_W =", spans_W)
+        print("periodicity (D,H,W) =", (perD, perH, perW))
         print("caps (dest units):", (capD, capH, capW))
 
     return ChunkDecodeConfig(
@@ -369,12 +437,16 @@ def _setup_chunk_decode_config(
         delta_r_lat=delta_r_lat,
         spans_D=spans_D, spans_H=spans_H, spans_W=spans_W,
         capD=capD, capH=capH, capW=capW,
+        periodicD=perD, periodicH=perH, periodicW=perW,
         debug=debug
     )
 
 
 def _compute_sub_tile_size(center_len_lat: int, cap_dest: Optional[int], dest_scale: int) -> int:
-    """Compute sub-tile size in latent units given a cap in dest units."""
+    """
+    For a given center length (LATENT) and per-stage cap (DEST units), return the sub-tile length in LATENT.
+    We enforce: (sub_len_lat * dest_scale) <= cap_dest   if cap provided.
+    """
     if cap_dest is None:
         return center_len_lat
     return max(1, min(center_len_lat, cap_dest // max(dest_scale, 1)))
@@ -389,7 +461,10 @@ def _generate_sub_tiles(
     capH: Optional[int],
     capW: Optional[int]
 ) -> List[SubTileRange]:
-    """Generate all sub-tile ranges for a given center block."""
+    """
+    Split a center block (cs:ce per axis, LATENT units) into sub-tiles so that the
+    per-stage tile output never exceeds the cap in DEST units.
+    """
     lenD_lat = ceD - csD
     lenH_lat = ceH - csH
     lenW_lat = ceW - csW
@@ -420,16 +495,54 @@ def _compute_read_window(
     sub_tile: SubTileRange,
     stage_local_lat: int,
     src_scale: int,
-    H: int, W: int, D: int
+    H: int, W: int, D: int,
+    perD: bool, perH: bool, perW: bool
 ) -> ReadWindow:
-    """Compute read window for a sub-tile with stage-local halo."""
-    rsD_lat = max(0, sub_tile.z0 - stage_local_lat)
-    reD_lat = min(D, sub_tile.z1 + stage_local_lat)
-    rsH_lat = max(0, sub_tile.y0 - stage_local_lat)
-    reH_lat = min(H, sub_tile.y1 + stage_local_lat)
-    rsW_lat = max(0, sub_tile.x0 - stage_local_lat)
-    reW_lat = min(W, sub_tile.x1 + stage_local_lat)
+    """
+    Compute the READ WINDOW for this sub-tile at this stage.
 
+    INPUTS:
+      sub_tile      : the sub-center [z0:z1], [y0:y1], [x0:x1] (LATENT units).
+      stage_local_lat: how many LATENT cells this stage adds to RF on each side.
+      src_scale     : scale factor from LATENT to SOURCE (prev-stage) units.
+      H,W,D         : latent sizes.
+      per*          : periodic flags per axis.
+
+    IMPORTANT:
+      - If an axis is periodic, we *allow* read window to go negative or > size,
+        then rely on periodic_getitem to wrap.
+      - If not periodic, we clamp to [0, size].
+    """
+    # D (last axis)
+    if perD:
+        # NOTE: Using modulo here collapses the window into [0..D) and loses the fact
+        # that the window spans across the border. It's *often* better to leave rs/re
+        # as raw (possibly negative/over) and let periodic_getitem handle wrapping.
+        # This code keeps modulo because it's "same code"; consider removing '%' if needed.
+        # NOTE: We've removed the modulo here as suggested by the author of the code.
+        rsD_lat = (sub_tile.z0 - stage_local_lat)
+        reD_lat = (sub_tile.z1 + stage_local_lat)
+    else:
+        rsD_lat = max(0, sub_tile.z0 - stage_local_lat)
+        reD_lat = min(D, sub_tile.z1 + stage_local_lat)
+
+    # H (height)
+    if perH:
+        rsH_lat = (sub_tile.y0 - stage_local_lat)
+        reH_lat = (sub_tile.y1 + stage_local_lat)
+    else:
+        rsH_lat = max(0, sub_tile.y0 - stage_local_lat)
+        reH_lat = min(H, sub_tile.y1 + stage_local_lat)
+
+    # W (width)
+    if perW:
+        rsW_lat = (sub_tile.x0 - stage_local_lat)
+        reW_lat = (sub_tile.x1 + stage_local_lat)
+    else:
+        rsW_lat = max(0, sub_tile.x0 - stage_local_lat)
+        reW_lat = min(W, sub_tile.x1 + stage_local_lat)
+
+    # SCALE to source coords
     return ReadWindow(
         rsD_lat=rsD_lat, reD_lat=reD_lat,
         rsH_lat=rsH_lat, reH_lat=reH_lat,
@@ -448,40 +561,74 @@ def _compute_tile_crop_coords(
     read_win: ReadWindow,
     src_scale: int,
     dest_scale: int,
-    up_factor: int
+    up_factor: int,
+    *,
+    # latent sizes and periodic flags (per axis)
+    D_lat: int, H_lat: int, W_lat: int,
+    perD: bool, perH: bool, perW: bool,
 ) -> TileCropCoords:
-    """Compute where to crop from tile and where to write in destination."""
-    # D axis
-    leftD_lat = sub_tile.z0 - read_win.rsD_lat
-    rightD_lat = sub_tile.z1 - read_win.rsD_lat
-    leftD_src = leftD_lat * src_scale
+    """
+    Compute how much of y_tile to keep (the valid center) and where to place it
+    in the destination buffer, with correct handling of periodic reads.
+
+    KEY IDEA (per axis):
+      - The tile 'x_in' was fetched starting at read_win.rs*_lat (latent coords),
+        possibly wrapping across the border. Inside this tile, offsets must be
+        measured along the wrapped sequence that starts at rs*_lat.
+      - So we compute distances modulo the axis length if that axis is periodic.
+
+      Let wrap_delta(start, target, size, periodic):
+        returns (target - start)          if not periodic
+                (target - start) % size   if periodic
+
+      Then:
+        left_lat  = wrap_delta(rs_lat,  center_start,  size, periodic)
+        right_lat = wrap_delta(rs_lat,  center_end,    size, periodic)
+
+        left_src  = left_lat  * src_scale
+        right_src = right_lat * src_scale
+
+        y_start   = left_src  * up_factor
+        y_end     = right_src * up_factor
+
+        g0        = center_start * dest_scale
+        g1        = center_end   * dest_scale
+    """
+
+    def wrap_delta(start: int, target: int, size: int, periodic: bool) -> int:
+        return ((target - start) % size) if periodic else (target - start)
+
+    # ---- D (last axis) ----
+    leftD_lat  = wrap_delta(read_win.rsD_lat, sub_tile.z0, D_lat, perD)
+    rightD_lat = wrap_delta(read_win.rsD_lat, sub_tile.z1, D_lat, perD)
+    leftD_src  = leftD_lat  * src_scale
     rightD_src = rightD_lat * src_scale
-    yD_start = leftD_src * up_factor
-    yD_end = rightD_src * up_factor
-    gD0 = sub_tile.z0 * dest_scale
-    gD1 = sub_tile.z1 * dest_scale
+    yD_start   = leftD_src  * up_factor
+    yD_end     = rightD_src * up_factor
+    gD0        = sub_tile.z0 * dest_scale
+    gD1        = sub_tile.z1 * dest_scale
 
-    # H axis
-    leftH_lat = sub_tile.y0 - read_win.rsH_lat
-    rightH_lat = sub_tile.y1 - read_win.rsH_lat
-    leftH_src = leftH_lat * src_scale
+    # ---- H (height) ----
+    leftH_lat  = wrap_delta(read_win.rsH_lat, sub_tile.y0, H_lat, perH)
+    rightH_lat = wrap_delta(read_win.rsH_lat, sub_tile.y1, H_lat, perH)
+    leftH_src  = leftH_lat  * src_scale
     rightH_src = rightH_lat * src_scale
-    yH_start = leftH_src * up_factor
-    yH_end = rightH_src * up_factor
-    gH0 = sub_tile.y0 * dest_scale
-    gH1 = sub_tile.y1 * dest_scale
+    yH_start   = leftH_src  * up_factor
+    yH_end     = rightH_src * up_factor
+    gH0        = sub_tile.y0 * dest_scale
+    gH1        = sub_tile.y1 * dest_scale
 
-    # W axis
-    leftW_lat = sub_tile.x0 - read_win.rsW_lat
-    rightW_lat = sub_tile.x1 - read_win.rsW_lat
-    leftW_src = leftW_lat * src_scale
+    # ---- W (width) ----
+    leftW_lat  = wrap_delta(read_win.rsW_lat, sub_tile.x0, W_lat, perW)
+    rightW_lat = wrap_delta(read_win.rsW_lat, sub_tile.x1, W_lat, perW)
+    leftW_src  = leftW_lat  * src_scale
     rightW_src = rightW_lat * src_scale
-    yW_start = leftW_src * up_factor
-    yW_end = rightW_src * up_factor
-    gW0 = sub_tile.x0 * dest_scale
-    gW1 = sub_tile.x1 * dest_scale
+    yW_start   = leftW_src  * up_factor
+    yW_end     = rightW_src * up_factor
+    gW0        = sub_tile.x0 * dest_scale
+    gW1        = sub_tile.x1 * dest_scale
 
-    # Sanity checks
+    # Safety: lengths must match along each axis.
     assert (yD_end - yD_start) == (gD1 - gD0), "D length mismatch"
     assert (yH_end - yH_start) == (gH1 - gH0), "H length mismatch"
     assert (yW_end - yW_start) == (gW1 - gW0), "W length mismatch"
@@ -496,78 +643,10 @@ def _compute_tile_crop_coords(
     )
 
 
-def _process_sub_tile(
-    sub_tile: SubTileRange,
-    stage_idx: int,
-    cfg: ChunkDecodeConfig,
-    z_latent: torch.Tensor,
-    prev_buf: Optional[_CPUStageBuffer],
-    dest_buf: _CPUStageBuffer,
-    run_stage_fn,
-    src_scale: int,
-    dest_scale: int,
-    up_factor: int,
-    stage_local_lat: int
-) -> None:
-    """Process a single sub-tile through one stage."""
-    # Compute read window
-    read_win = _compute_read_window(
-        sub_tile, stage_local_lat, src_scale,
-        cfg.H, cfg.W, cfg.D
-    )
-
-    # Fetch source block
-    if stage_idx == 0:
-        x_in = z_latent[...,
-                        read_win.rsH_lat:read_win.reH_lat,
-                        read_win.rsW_lat:read_win.reW_lat,
-                        read_win.rsD_lat:read_win.reD_lat]
-        x_in = x_in.to(device=cfg.device, dtype=z_latent.dtype, non_blocking=False).contiguous()
-    else:
-        x_in = prev_buf.read_block(
-            z0=read_win.rsD_src, z1=read_win.reD_src,
-            y0=read_win.rsH_src, y1=read_win.reH_src,
-            x0=read_win.rsW_src, x1=read_win.reW_src,
-            device=cfg.device, dtype=cfg.model_dtype
-        )
-
-    if cfg.debug:
-        print(f"[S{stage_idx}] sub-tile D:{sub_tile.z0}:{sub_tile.z1} "
-              f"H:{sub_tile.y0}:{sub_tile.y1} W:{sub_tile.x0}:{sub_tile.x1} | "
-              f"x_in.shape={tuple(x_in.shape)}")
-
-    # Run stage
-    y_tile = run_stage_fn(stage_idx, x_in)
-
-    # Compute crop coordinates
-    crop_coords = _compute_tile_crop_coords(
-        sub_tile, read_win, src_scale, dest_scale, up_factor
-    )
-
-    # Crop and write
-    y_center = y_tile[...,
-                      crop_coords.yH_start:crop_coords.yH_end,
-                      crop_coords.yW_start:crop_coords.yW_end,
-                      crop_coords.yD_start:crop_coords.yD_end]
-
-    dest_buf.write_block(
-        z0=crop_coords.gD0, z1=crop_coords.gD1,
-        y0=crop_coords.gH0, y1=crop_coords.gH1,
-        x0=crop_coords.gW0, x1=crop_coords.gW1,
-        tile=y_center
-    )
-
-    # Cleanup
-    del y_tile, y_center, x_in
-    if torch.cuda.is_available():
-        torch.cuda.synchronize(cfg.device)
-        torch.cuda.empty_cache()
-
-
 # ------------------------------ Main entry --------------------------------- #
 
 @torch.inference_mode()
-def chunk_decode_strategy_b_3d(  # noqa: C901
+def chunk_decode_strategy_b_3d(  # noqa: C901 (complex by design; heavily commented)
     decoder,                    # your VAEDecoder
     z_latent: torch.Tensor,     # [B, z_dim, H, W, D] (CPU or GPU)
     chunk_latent: Union[int, Tuple[int, int, int], List[int]],
@@ -581,93 +660,52 @@ def chunk_decode_strategy_b_3d(  # noqa: C901
     # Cap any per-stage CUDA tensor spatial size (in that stage's OUTPUT units).
     # Accepts int or (D_out, H_out, W_out).
     max_stage_out_chunk: Optional[Union[int, Tuple[int, int, int], List[int]]] = 128,
+    # NEW: periodicity flags in order (D, H, W). True means wrap that axis.
+    periodicity: Union[bool, Tuple[bool, bool, bool], List[bool]] = False,
 ) -> torch.Tensor:
     """
-    General 3D chunk decoder using Strategy B (multi-stage halo streaming).
+    GENERAL 3D CHUNKED DECODE with Strategy B + optional periodic reads.
 
-    Parameters
-    ----------
-    decoder : VAEDecoder
-        Your decoder module (no attention).
-    z_latent : torch.Tensor
-        Latent tensor [B, z_dim, H, W, D], can be on CPU or GPU.
-    chunk_latent : int | (D, H, W)
-        Desired *Stage-0* chunk sizes in LATENT units along (D, H, W).
-        - If an axis chunk >= axis length, that axis is not chunked (single span).
-        - Values include the Stage-0 halo; the center width per axis is
-          (chunk - 2*radius0), auto-clamped to >=1.
-    device : str | torch.device | None
-        Compute device for per-stage tiles. Defaults to decoder's device.
-    time : torch.Tensor | None
-        Optional time embedding input, forwarded into each stage.
-    debug : bool
-        Print detailed index math and shapes per tile/sub-tile.
-    max_stage_out_chunk : int | (D_out, H_out, W_out) | None
-        Upper bound for any single per-stage CUDA tensor’s spatial extents,
-        measured in that stage's OUTPUT units (after that stage's upsampling).
-        Use None to disable (not recommended for large volumes).
-
-    Returns
-    -------
-    torch.Tensor
-        Final decoded tensor on CPU: [B, out_C, H*scale, W*scale, D*scale].
-
-    Notes
-    -----
-    Index mapping per stage s (identical on each axis):
-
-      Let (cs, ce) be a *center span in LATENT units*.
-      For a sub-center [l0, l1] (latent):
-
-        - Stage-local halo (latent):    h_lat_s = delta_r_lat[s]
-        - Source scale:                 src_scale = scales_after[s-1] (for s>0; =1 for s=0)
-        - Dest scale:                   dest_scale = scales_after[s]
-        - Up factor:                    up = dest_scale // src_scale (1 or 2)
-
-      Read window in LATENT units:      [rs_lat, re_lat] = [max(l0-h_lat_s, 0), min(l1+h_lat_s, L)]
-      Map to SOURCE coords:             [rs_src, re_src] = [rs_lat*src_scale, re_lat*src_scale]
-      Offsets INSIDE read window (src): left_src  = (l0 - rs_lat)*src_scale
-                                        right_src = (l1 - rs_lat)*src_scale
-      Offsets in stage output (tile y): y_start = left_src  * up
-                                        y_end   = right_src * up
-
-      Global write range in DEST units: write0 = l0 * dest_scale
-                                        write1 = l1 * dest_scale
-
-      Lengths match by construction:
-        (y_end - y_start) == (write1 - write0)
+    NOTE ABOUT PERIODICITY IMPLEMENTATION:
+      - The *reads* use periodic_getitem on [B*C, H, W, D] views.
+      - The computation of read windows for periodic axes uses modulo here (same code).
+        If your periodic_getitem expects raw (possibly negative) slice bounds, consider
+        removing the '%' in _compute_read_window so [rs, re] can be negative/over.
+        Then let periodic_getitem do the wrapping, which is usually safer.
     """
-    # Setup configuration
+    # Build configuration (tiling plan, radii, scales, caps, flags)
     cfg = _setup_chunk_decode_config(
-        decoder, z_latent, chunk_latent, device, max_stage_out_chunk, debug
+        decoder, z_latent, chunk_latent, device, max_stage_out_chunk, periodicity, debug
     )
-
-    # Stage runner closure
     num_res = int(decoder.config.num_resolutions)
 
+    # Choose which chunk of the decoder to run per stage 's'
     def run_stage(s: int, x: torch.Tensor) -> torch.Tensor:
         if s == 0:
             return _run_stage0(decoder, x, time)
         elif 1 <= s <= (num_res - 1):
-            level_index = (num_res - s)
+            level_index = (num_res - s)  # maps s=1..N-1 to level=(N-1..1)
             return _run_up_stage(decoder, x, level_index, time)
         else:
             return _run_final_stage(decoder, x, time)
 
-    # Initialize stage buffers
+    # CPU buffers: one per stage, allocated lazily when we see the first y_tile
     stage_bufs: List[Optional[_CPUStageBuffer]] = [None] * cfg.num_stages
-    prev_scale = 1
+    prev_scale = 1  # total scale after previous stage
     prev_buf: Optional[_CPUStageBuffer] = None
 
+    # Ensure eval-only mode for the decoder; restore at the end
     was_training = decoder.training
     decoder.eval()
 
-    # Process each stage
+    # ========================== MAIN STAGE LOOP ============================
     for s in range(cfg.num_stages):
-        stage_local_lat = cfg.delta_r_lat[s]
-        dest_scale = cfg.scales_after[s]
-        src_scale = prev_scale
-        up_factor = dest_scale // src_scale
+        stage_local_lat = cfg.delta_r_lat[s]    # how many LATENT cells this stage adds to RF
+        dest_scale      = cfg.scales_after[s]   # total scale after this stage
+        # BUG/NOTE: original line had "src_scale = crop = prev_scale". The 'crop' is unused.
+        # Keeping the same tokens but be aware it's just 'src_scale = prev_scale'.
+        src_scale       = prev_scale
+        up_factor       = dest_scale // src_scale  # either 1 or 2 (per-stage upsample)
 
         if cfg.debug:
             print(f"\n=== Stage {s} ===")
@@ -675,64 +713,166 @@ def chunk_decode_strategy_b_3d(  # noqa: C901
                   f"src_scale={src_scale}, dest_scale={dest_scale}, up_factor={up_factor}")
 
         dest_buf = stage_bufs[s]
-        dest_created = dest_buf is not None
+        dest_created = dest_buf is not None  # false until we allocate
 
-        # Iterate over center blocks
+        # OUTER LOOPS over Stage-0 center blocks in (D,H,W).
+        # We then sub-tile each block if the DEST cap would be exceeded.
         for (csD, ceD) in cfg.spans_D:
             for (csH, ceH) in cfg.spans_H:
                 for (csW, ceW) in cfg.spans_W:
-                    # Generate sub-tiles for this center block
-                    sub_tiles = _generate_sub_tiles(
-                        csD, ceD, csH, ceH, csW, ceW,
-                        dest_scale, cfg.capD, cfg.capH, cfg.capW
-                    )
 
-                    # Process each sub-tile
-                    for sub_tile in sub_tiles:
-                        # Allocate dest buffer on first tile
-                        if not dest_created:
-                            # Need to run one tile to get output shape
-                            temp_read = _compute_read_window(
-                                sub_tile, stage_local_lat, src_scale,
-                                cfg.H, cfg.W, cfg.D
-                            )
-                            if s == 0:
-                                temp_in = z_latent[...,
-                                                   temp_read.rsH_lat:temp_read.reH_lat,
-                                                   temp_read.rsW_lat:temp_read.reW_lat,
-                                                   temp_read.rsD_lat:temp_read.reD_lat]
-                                temp_in = temp_in.to(device=cfg.device, dtype=z_latent.dtype)
-                            else:
-                                temp_in = prev_buf.read_block(
-                                    z0=temp_read.rsD_src, z1=temp_read.reD_src,
-                                    y0=temp_read.rsH_src, y1=temp_read.reH_src,
-                                    x0=temp_read.rsW_src, x1=temp_read.reW_src,
-                                    device=cfg.device, dtype=cfg.model_dtype
+                    # Compute sub-tile sizes (in LATENT units) so that
+                    # (sub_len_lat * dest_scale) <= cap along each axis (if provided).
+                    def _sub_len_lat(center_len_lat: int, cap_dest: Optional[int]) -> int:
+                        if cap_dest is None:
+                            return center_len_lat
+                        return max(1, min(center_len_lat, cap_dest // max(dest_scale, 1)))
+
+                    lenD_lat = ceD - csD
+                    lenH_lat = ceH - csH
+                    lenW_lat = ceW - csW
+                    subD = _sub_len_lat(lenD_lat, cfg.capD)
+                    subH = _sub_len_lat(lenH_lat, cfg.capH)
+                    subW = _sub_len_lat(lenW_lat, cfg.capW)
+
+                    if cfg.debug:
+                        print(f"Stage {s} subD: {subD}, subH: {subH}, subW: {subW}")
+                        print(f"Stage {s} csD: {csD}, ceD: {ceD}, csH: {csH}, ceH: {ceH}, csW: {csW}, ceW: {ceW}")
+                        print(f"Stage {s} stage_local_lat: {stage_local_lat}, src_scale: {src_scale}, dest_scale: {dest_scale}, up_factor: {up_factor}")
+
+                    # INNER LOOPS over sub-tiles (LATENT coords)
+                    z0 = csD
+                    while z0 < ceD:
+                        z1 = min(z0 + subD, ceD)
+                        y0 = csH
+                        while y0 < ceH:
+                            y1 = min(y0 + subH, ceH)
+                            x0 = csW
+                            while x0 < ceW:
+                                x1 = min(x0 + subW, ceW)
+                                sub_tile = SubTileRange(z0, z1, y0, y1, x0, x1)
+
+                                # --- READ WINDOW (in LATENT and SOURCE units)
+                                # NOTE on periodic axes:
+                                #   - This function currently applies '% size' (same code you posted),
+                                #     which loses the fact a window can cross borders. If you want
+                                #     to *fully* delegate to periodic_getitem, remove the modulo and
+                                #     let rs/re be negative/over. periodic_getitem will wrap both sides.
+                                read_win = _compute_read_window(
+                                    sub_tile, stage_local_lat, src_scale,
+                                    cfg.H, cfg.W, cfg.D,
+                                    cfg.periodicD, cfg.periodicH, cfg.periodicW
                                 )
-                            temp_out = run_stage(s, temp_in)
-                            C_out = int(temp_out.shape[1])
-                            Hs = cfg.H * dest_scale
-                            Ws = cfg.W * dest_scale
-                            Ds = cfg.D * dest_scale
-                            stage_bufs[s] = _CPUStageBuffer(
-                                shape=(cfg.B, C_out, Hs, Ws, Ds),
-                                dtype=temp_out.dtype
-                            )
-                            dest_buf = stage_bufs[s]
-                            dest_created = True
-                            del temp_in, temp_out
 
-                            if cfg.debug:
-                                print(f"[S{s}] Alloc dest buffer shape={(cfg.B, C_out, Hs, Ws, Ds)}")
+                                # --- FETCH SOURCE BLOCK (periodic_getitem) ---
+                                if s == 0:
+                                    # SOURCE is z_latent @ LATENT scale
+                                    # SHAPE: z_latent [B, zC, H, W, D]  -> flatten channels to [B*zC, H, W, D]
+                                    B0, C0, Hs, Ws, Ds = z_latent.shape
+                                    flat = z_latent.reshape(B0 * C0, Hs, Ws, Ds)
 
-                        _process_sub_tile(
-                            sub_tile, s, cfg, z_latent, prev_buf, dest_buf,
-                            run_stage, src_scale, dest_scale, up_factor, stage_local_lat
-                        )
+                                    # Build possibly out-of-range slices for H,W,D (periodic axes wrap)
+                                    sy = slice(read_win.rsH_lat, read_win.reH_lat, None)
+                                    sx = slice(read_win.rsW_lat, read_win.reW_lat, None)
+                                    sz = slice(read_win.rsD_lat, read_win.reD_lat, None)
 
+                                    # periodic_getitem on [B*zC, H, W, D]
+                                    x_in_flat = periodic_getitem(flat, slice(None), sy, sx, sz)
+
+                                    # Back to [B, zC, h, w, d] on the target device/dtype
+                                    x_in = x_in_flat.reshape(B0, C0, x_in_flat.shape[1], x_in_flat.shape[2], x_in_flat.shape[3])
+                                    x_in = x_in.to(device=cfg.device, dtype=z_latent.dtype, non_blocking=False).contiguous()
+                                else:
+                                    # SOURCE is previous stage output (CPU buffer), currently [B, C, Hs, Ws, Ds].
+                                    # Flatten to [B*C, Hs, Ws, Ds] so periodic_getitem sees channels first.
+                                    Bp, Cp, Hs, Ws, Ds = prev_buf.tensor.shape
+                                    flat = prev_buf.tensor.reshape(Bp * Cp, Hs, Ws, Ds)
+
+                                    # Build slices in SOURCE units
+                                    sy = slice(read_win.rsH_src, read_win.reH_src, None)
+                                    sx = slice(read_win.rsW_src, read_win.reW_src, None)
+                                    sz = slice(read_win.rsD_src, read_win.reD_src, None)
+
+                                    x_in_flat = periodic_getitem(flat, slice(None), sy, sx, sz)
+
+                                    # Back to [B, C, h, w, d]
+                                    x_in = x_in_flat.reshape(Bp, Cp, x_in_flat.shape[1], x_in_flat.shape[2], x_in_flat.shape[3])
+                                    x_in = x_in.to(device=cfg.device, dtype=cfg.model_dtype, non_blocking=False).contiguous()
+
+                                # --- RUN ONLY THIS STAGE ---
+                                y_tile = run_stage(s, x_in)  # SHAPE: [B, C_out, h*, w*, d*] in this stage
+
+                                # --- ALLOCATE DEST BUFFER (for whole stage) ON FIRST TILE ---
+                                if not dest_created:
+                                    B_, C_out = cfg.B, int(y_tile.shape[1])
+                                    Hs_out = cfg.H * dest_scale
+                                    Ws_out = cfg.W * dest_scale
+                                    Ds_out = cfg.D * dest_scale
+                                    stage_bufs[s] = _CPUStageBuffer(
+                                        shape=(B_, C_out, Hs_out, Ws_out, Ds_out),
+                                        dtype=y_tile.dtype
+                                    )
+                                    dest_buf = stage_bufs[s]
+                                    dest_created = True
+                                    if cfg.debug:
+                                        print(f"[S{s}] Alloc dest buffer shape={(B_, C_out, Hs_out, Ws_out, Ds_out)}")
+
+                                # --- CROP VALID CENTER FROM y_tile & WRITE TO CPU DEST ---
+                                crop = _compute_tile_crop_coords(
+                                    sub_tile, read_win, src_scale, dest_scale, up_factor,
+                                    D_lat=cfg.D, H_lat=cfg.H, W_lat=cfg.W,
+                                    perD=cfg.periodicD, perH=cfg.periodicH, perW=cfg.periodicW,
+                                )
+
+                                if cfg.debug:
+                                    print('--------------------------------')
+                                    print(f"[S{s}] Crop Coords:"
+                                          f" H_start: {crop.yH_start}, H_end: {crop.yH_end},"
+                                          f" W_start: {crop.yW_start}, W_end: {crop.yW_end},"
+                                          f" D_start: {crop.yD_start}, D_end: {crop.yD_end}")
+
+                                    # Additional analytics
+                                    print(f"[S{s}] Global Coords:"
+                                          f" gH0: {crop.gH0}, gH1: {crop.gH1},"
+                                          f" gW0: {crop.gW0}, gW1: {crop.gW1},"
+                                          f" gD0: {crop.gD0}, gD1: {crop.gD1}")
+                                    print(f"[S{s}] Tile Shape:"
+                                          f" Height: {crop.yH_end - crop.yH_start},"
+                                          f" Width: {crop.yW_end - crop.yW_start},"
+                                          f" Depth: {crop.yD_end - crop.yD_start}")
+                                    print('--------------------------------')
+                                # Slice valid center (note axis order: [..., H, W, D] in the tail)
+                                y_center = y_tile[...,
+                                                  crop.yH_start:crop.yH_end,
+                                                  crop.yW_start:crop.yW_end,
+                                                  crop.yD_start:crop.yD_end]
+
+                                # Write to CPU buffer in global DEST coords
+                                dest_buf.write_block(
+                                    z0=crop.gD0, z1=crop.gD1,
+                                    y0=crop.gH0, y1=crop.gH1,
+                                    x0=crop.gW0, x1=crop.gW1,
+                                    tile=y_center
+                                )
+
+                                # --- FREE ASAP (limit GPU memory) ---
+                                del y_tile, y_center, x_in, x_in_flat
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize(cfg.device)
+                                    torch.cuda.empty_cache()
+
+                                # Advance sub-tiles in W
+                                x0 = x1
+                            # Advance sub-tiles in H
+                            y0 = y1
+                        # Advance sub-tiles in D
+                        z0 = z1
+
+        # NEXT STAGE will read from this stage's buffer
         prev_scale = dest_scale
-        prev_buf = dest_buf
+        prev_buf   = dest_buf
 
+    # Restore training flag and return final stage output (CPU)
     decoder.train(was_training)
     return stage_bufs[-1].tensor
 
@@ -751,21 +891,13 @@ if __name__ == "__main__":
     #
     # z = torch.randn(1, cfg.z_dim, 32, 32, 64)  # [B,zC,H,W,D]
     #
-    # # Chunk along D only (like the old Z-only path), S0 chunk=16; cap deep-stage tiles to 64^3:
     # y = chunk_decode_strategy_b_3d(
     #     dec, z,
-    #     chunk_latent=16,                 # int -> (16,16,16) but spans_H/W collapse to (0,H),(0,W)
+    #     chunk_latent=(16, 64, 64),        # tile in D only; (D,H,W) in LATENT units
     #     device="cuda:0",
     #     debug=True,
-    #     max_stage_out_chunk=(64, 64, 64) # caps in stage output coords
-    # )
-    #
-    # # Chunk along all axes with different sizes:
-    # y2 = chunk_decode_strategy_b_3d(
-    #     dec, z,
-    #     chunk_latent=(32, 16, 16),       # (D,H,W) in latent units
-    #     device="cuda:0",
-    #     max_stage_out_chunk=(96, 96, 64)
+    #     max_stage_out_chunk=(64, 128, 128),
+    #     periodicity=(True, False, False),  # wrap only D axis
     # )
     #
     pass
