@@ -1,7 +1,7 @@
 import math
 
 import torch
-
+import einops
 # The following import is done for not breaking any code importing
 # attention layers from commonlayers.py
 from .attention import (NDimensionalAttention,  # noqa: F401
@@ -531,11 +531,22 @@ class ResnetTimeBlock(torch.nn.Module):
         -------
         torch.Tensor of shape (nbatch, output_channels, 1, 1, 1)
         """
-        # te : (nbatch, embed_channels)
+        # te : (nbatch, embed_channels) or (nbatch, embed_channels, *shape_dims)
         # returns : (nbatch, output_channels, 1, 1, 1)
-        yt = self.net(te)
-        newdim = yt.shape + (1,) * self.dimension
-        yt = yt.view(*newdim)
+        if te.ndim - 2 == self.dimension:
+            # Special case, it began as (nbatch, embed_channels, *shape_dims)
+            # It will end as (nbatch * shape_dims, embed_channels)
+            shape_strings = ' '.join([f's{dim}' for dim in range(2, te.ndim)])
+            kwargs = {f's{dim}': te.shape[dim] for dim in range(2, te.ndim)}
+            pattern = f'nbatch embed {shape_strings} -> (nbatch {shape_strings}) embed'
+            te = einops.rearrange(te, pattern, **kwargs)
+            yt = self.net(te)
+            pattern = f'(nbatch {shape_strings}) embed -> nbatch embed {shape_strings}'
+            yt = einops.rearrange(yt, pattern, **kwargs)
+        elif te.ndim - 2 == 0:
+            yt = self.net(te)
+            newdim = yt.shape + (1,) * self.dimension
+            yt = yt.view(*newdim)
         return yt
 
 
@@ -813,6 +824,7 @@ class ResnetBlockC(torch.nn.Module):
         y = self.conv1(self.act(self.gnorm1(x)))  # (B, C_out, D, H, W)
         if self.has_time_embed:
             yt = self.timeblock(te)
+            yt = self.rescale_yt(yt, y)
             y = y + yt  # (B, C_out, D, H, W)
         y = self.conv2(
             self.dropout(self.act((self.gnorm2(y))))
@@ -822,6 +834,39 @@ class ResnetBlockC(torch.nn.Module):
         if self.extra_residual is not None:
             y = y + self.extra_residual(x)
         return y
+
+    def rescale_yt(self, yt, y):  # noqa: C901
+        yt_dims = tuple(yt.shape[2:])
+        y_dims = tuple(y.shape[2:])
+        if yt_dims == (1,) * self.dimension:
+            return yt
+        elif yt_dims == y_dims:
+            return yt
+        else:
+            shape_factor = yt_dims[0] / y_dims[0]
+            if shape_factor > 1:  # Downscale
+                shape_factor = int(shape_factor)
+                for dy, dyt in zip(y_dims, yt_dims):
+                    if dy * shape_factor != dyt:
+                        raise ValueError(f"yt_dims {yt_dims} and y_dims {y_dims} are not compatible")
+                if self.dimension == 1:
+                    downscaler = CornerPool1d(shape_factor)
+                elif self.dimension == 2:
+                    downscaler = CornerPool2d(shape_factor)
+                elif self.dimension == 3:
+                    downscaler = CornerPool3d(shape_factor)
+                else:
+                    raise ValueError(f"Invalid dimension {self.dimension}")
+                return downscaler(yt)
+            elif shape_factor < 1:  # Upscale
+                shape_factor = int(1 / shape_factor)
+                for dy, dyt in zip(y_dims, yt_dims):
+                    if dyt * shape_factor != dy:
+                        raise ValueError(f"yt_dims {yt_dims} and y_dims {y_dims} are not compatible")
+                upscaler = torch.nn.Upsample(shape_factor, mode='nearest')
+                return upscaler(yt)
+            else:
+                return yt
 
     def get_convolution_function(self):
         if self.convolution_type == "default":
@@ -881,8 +926,8 @@ class CircularConv2d(torch.nn.Module):
         self.kernel_size = kernel_size
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.padding = kernel_size//2
-        
+        self.padding = kernel_size // 2
+
         kwargs['padding'] = 0
         self.conv = torch.nn.Conv2d(in_channels,
                                     out_channels,
@@ -918,3 +963,68 @@ class CircularConv3d(torch.nn.Module):
     def forward(self, x):
         x = self.pad(x)
         return self.conv(x)
+
+
+class CornerPool1d(torch.nn.Module):
+    """Subsampling that picks the first element of each pooling window."""
+
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x):
+        # x: (N, C, L)
+        if self.padding > 0:
+            x = torch.nn.functional.pad(x, (self.padding, self.padding))
+        # Just slice with the stride - first element of each window
+        return x[..., ::self.stride]
+
+    def extra_repr(self):
+        return f'kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}'
+
+
+class CornerPool2d(torch.nn.Module):
+    """Subsampling that picks the top-left corner of each pooling window."""
+
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if stride is not None else self.kernel_size
+        self.stride = self.stride if isinstance(self.stride, tuple) else (self.stride, self.stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+        self.dilation = dilation
+
+    def forward(self, x):
+        # x: (N, C, H, W)
+        if self.padding[0] > 0 or self.padding[1] > 0:
+            x = torch.nn.functional.pad(x, (self.padding[1], self.padding[1], self.padding[0], self.padding[0]))
+        return x[..., ::self.stride[0], ::self.stride[1]]
+
+    def extra_repr(self):
+        return f'kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}'
+
+
+class CornerPool3d(torch.nn.Module):
+    """Subsampling that picks the corner element of each pooling window."""
+
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size,) * 3
+        self.stride = stride if stride is not None else self.kernel_size
+        self.stride = self.stride if isinstance(self.stride, tuple) else (self.stride,) * 3
+        self.padding = padding if isinstance(padding, tuple) else (padding,) * 3
+        self.dilation = dilation
+
+    def forward(self, x):
+        # x: (N, C, D, H, W)
+        if any(p > 0 for p in self.padding):
+            x = torch.nn.functional.pad(x, (self.padding[2], self.padding[2],
+                                        self.padding[1], self.padding[1],
+                                        self.padding[0], self.padding[0]))
+        return x[..., ::self.stride[0], ::self.stride[1], ::self.stride[2]]
+
+    def extra_repr(self):
+        return f'kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}'

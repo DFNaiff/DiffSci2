@@ -397,6 +397,9 @@ class PUNetG(torch.nn.Module):
                 ye = y
             else:
                 ye = self.conditional_embedding(y)  # [B, C]
+            if ye.ndim > te.ndim:
+                new_te_shape = list(te.shape) + [1] * (ye.ndim - te.ndim)
+                te = te.reshape(new_te_shape)
             te = te + self.cond_dropout(ye)  # [B, C]
         x, intermediate_outputs = self.encode(x, te)
         x = self.bottom_forward(x, te)
