@@ -10,7 +10,7 @@ import numpy as np
 import lightning
 
 from diffsci.torchutils import broadcast_from_below, dict_unsqueeze, dict_to
-from diffsci.models.aux_scripts import DimensionAgnosticBatchNorm, IdentityBatchNorm
+from diffsci.models.aux_scripts import DimensionAgnosticBatchNorm, ConstantBatchNorm, IdentityBatchNorm
 
 
 SampleType = Float[Tensor, "batch *shape"]
@@ -235,7 +235,7 @@ class SIModuleConfig(torch.nn.Module):
                  scheduler: SIScheduler | str = 'linear',
                  scheduler_args: dict[str, Any] = {},
                  num_channels: int | None = None,
-                 initial_norm: bool = False,
+                 initial_norm: bool | float = False,
                  autonomous_flow: bool = False,
                  precondition_fn: Callable | str | None = None,
                  loss_weighting: Literal['edm', 'uniform'] | dict[str, Any] = 'uniform',
@@ -334,10 +334,15 @@ class SIModule(lightning.LightningModule):
         return x, y
 
     def set_initial_norm(self):
-        if self.config.initial_norm:
-            self.initial_norm = DimensionAgnosticBatchNorm(self.config.num_channels)
+        if isinstance(self.config.initial_norm, bool):
+            if self.config.initial_norm:
+                self.initial_norm = DimensionAgnosticBatchNorm(self.config.num_channels)
+            else:
+                self.initial_norm = IdentityBatchNorm()
+        elif isinstance(self.config.initial_norm, float) or isinstance(self.config.initial_norm, int):
+            self.initial_norm = ConstantBatchNorm(self.config.initial_norm)
         else:
-            self.initial_norm = IdentityBatchNorm()
+            raise ValueError(f"Invalid initial norm: {self.config.initial_norm}")
 
     def loss_fn(self,
                 x: Float[Tensor, "batch *shape"],  # noqa: F821, typing
@@ -554,6 +559,9 @@ class SIModule(lightning.LightningModule):
         warnings.warn("We are assuming we are in latent space for inpainting")
         with torch.inference_mode():
             with torch.no_grad():
+                if y is not None:
+                    warnings.warn("Moving y to device: {}".format(self.device))
+                    y = dict_to(y, self.device)
                 x_orig = x_orig.to(self.device)
                 mask = mask.to(self.device)
                 shape = x_orig.shape

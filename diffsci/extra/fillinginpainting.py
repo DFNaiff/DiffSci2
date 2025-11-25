@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Any
 from jaxtyping import Float
 from torch import Tensor
 import torch
@@ -300,7 +300,7 @@ def sample_grid_volume(
     grid_map: list[int],
     base_shape: list[int],
     overlap_size: int,
-    y: None | Float[Tensor, "*yshape"] = None,
+    y: None | dict[str, torch.Tensor] | np.ndarray = None,
     guidance: float = 1.0,
     nsteps: int = 30,
     integrate_on_sigma: bool = False,
@@ -328,6 +328,9 @@ def sample_grid_volume(
     Returns:
         Generated volume tensor of shape [1, channels, final_dx, final_dy, final_dz]
     """
+    if isinstance(y, dict) or y is None:
+        total_grid_map = np.prod(grid_map)
+        y = np.array([y for _ in range(total_grid_map)]).reshape(grid_map)
     # Compute final volume shape
     final_shape = [
         base_shape[0],
@@ -376,7 +379,7 @@ def sample_grid_volume(
             generated_cube = flow_module.sample(
                 nsamples=1,
                 shape=extended_shape,
-                y=y,
+                y=y[grid_pos[0], grid_pos[1], grid_pos[2]],
                 guidance=guidance,
                 nsteps=nsteps,
                 is_latent_shape=True,
@@ -404,7 +407,7 @@ def sample_grid_volume(
                 x_orig=x_orig,
                 mask=mask,
                 nsamples=1,
-                y=y,
+                y=y[grid_pos[0], grid_pos[1], grid_pos[2]],
                 guidance=guidance,
                 nsteps=nsteps,
                 integrate_on_sigma=integrate_on_sigma,
@@ -417,13 +420,6 @@ def sample_grid_volume(
         # if generated_cube.dim() == len(cube_shape) + 1 and generated_cube.shape[0] == 1:
             # generated_cube = generated_cube[0]
         generated_cube = generated_cube[0]
-        print('-------------------------------')
-        print(grid_ind)
-        print(grid_pos)
-        print(spatial_bounds)
-        print(volume.shape)
-        print(generated_cube.shape)
-        print('--------------------------------')
         # Combine generated cube into volume
         volume = _combine_cube_into_volume(volume[0], generated_cube, spatial_bounds, blend_mode)
         volume = volume.unsqueeze(0)  # Add batch dim back

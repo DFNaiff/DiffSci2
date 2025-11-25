@@ -171,6 +171,24 @@ class DimensionAgnosticBatchNorm(torch.nn.Module):
         return x
 
 
+class ConstantBatchNorm(torch.nn.Module):
+    def __init__(self, sigma: float = 1.0):
+        super().__init__()
+        self.sigma = sigma
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x / self.sigma
+
+    def unnorm(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.sigma
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x / self.sigma
+
+    def unnormalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.sigma
+
+
 class IdentityBatchNorm(torch.nn.Module):
     def __init__(self):
         super().__init__()
