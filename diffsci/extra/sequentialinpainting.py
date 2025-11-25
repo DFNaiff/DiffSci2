@@ -91,6 +91,9 @@ def sample_sequential_z(
     integrate_on_sigma: bool = False,
     noise_injection: bool = True,
     blend_mode: Literal['cosine', 'latest'] = 'cosine',
+    mask_falloff: int = 0,
+    resample_steps: int = 0,
+    jump_length: int = 1,
     **kwargs
 ) -> Float[Tensor, "batch channels dx dy final_dz"]:
     """
@@ -209,7 +212,6 @@ def sample_sequential_z(
                 integrate_on_sigma=integrate_on_sigma,
                 noise_injection=noise_injection,
                 return_latents=True,
-                **kwargs
             )
             # generated_block shape: [1, channels, dx, dy, extended_dz]
             generated_block = generated_block[0]  # Remove batch dim
@@ -243,7 +245,9 @@ def sample_sequential_z(
                 nsteps=nsteps,
                 integrate_on_sigma=integrate_on_sigma,
                 noise_injection=noise_injection,
-                **kwargs
+                mask_falloff=mask_falloff,
+                resample_steps=resample_steps,
+                jump_length=jump_length,
             )
             generated_block = generated_block[0]  # Remove batch dim
 

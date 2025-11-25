@@ -307,6 +307,9 @@ def sample_grid_volume(
     noise_injection: bool = False,
     blend_mode: Literal['latest', 'cosine'] = 'latest',
     periodicity: list[bool] = [False, False, False],
+    mask_falloff: int = 0,
+    resample_steps: int = 0,
+    jump_length: int = 1,
     **kwargs
 ) -> Float[Tensor, "batch *final_shape"]:
     """
@@ -323,6 +326,9 @@ def sample_grid_volume(
         integrate_on_sigma: Whether to integrate on sigma
         noise_injection: Whether to inject noise during integration
         blend_mode: How to handle overlaps ('latest' or 'cosine')
+        mask_falloff: Soft mask gradient width (0 = hard mask)
+        resample_steps: Number of resample iterations (RePaint-style)
+        jump_length: Steps to jump back when resampling
         **kwargs: Additional arguments passed to sample() and inpaint()
 
     Returns:
@@ -387,7 +393,6 @@ def sample_grid_volume(
                 noise_injection=noise_injection,
                 orig_noise=noise_slice,
                 return_latents=True,
-                **kwargs
             )
         else:
             # Use inpainting for edges/faces/centers
@@ -413,7 +418,9 @@ def sample_grid_volume(
                 integrate_on_sigma=integrate_on_sigma,
                 noise_injection=noise_injection,
                 orig_noise=noise_slice,  # Remove batch dim for inpaint
-                **kwargs
+                mask_falloff=mask_falloff,
+                resample_steps=resample_steps,
+                jump_length=jump_length,
             )
 
         # inpaint returns [batch, *shape], remove batch dim if needed

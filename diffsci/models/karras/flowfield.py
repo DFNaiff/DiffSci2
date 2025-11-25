@@ -553,7 +553,11 @@ class SIModule(lightning.LightningModule):
         nsteps: int = 30,
         integrate_on_sigma: bool = False,
         noise_injection: bool = False,
-        orig_noise: Float[Tensor, "batch *shape"] | None = None  # noqa: F821, typing
+        orig_noise: Float[Tensor, "batch *shape"] | None = None,  # noqa: F821, typing
+        # New parameters for improved inpainting:
+        mask_falloff: int = 0,  # Soft mask gradient width (0 = hard mask)
+        resample_steps: int = 0,  # Number of resample iterations (RePaint-style)
+        jump_length: int = 1,  # Steps to jump back when resampling
     ) -> Float[Tensor, "batch *shape"]:  # noqa F821, typing
         # mask: 1 for where data is present, 0 for where data is absent
         warnings.warn("We are assuming we are in latent space for inpainting")
@@ -565,6 +569,13 @@ class SIModule(lightning.LightningModule):
                 x_orig = x_orig.to(self.device)
                 mask = mask.to(self.device)
                 shape = x_orig.shape
+
+                # Create soft mask if falloff is specified
+                if mask_falloff > 0:
+                    soft_mask = self._create_soft_mask(mask, mask_falloff)
+                else:
+                    soft_mask = mask
+
                 x_orig = x_orig.unsqueeze(0)
                 x_orig = self.initial_norm(x_orig)
                 if orig_noise is None:
@@ -576,26 +587,108 @@ class SIModule(lightning.LightningModule):
                 time_schedule = torch.linspace(1, 0, nsteps).to(x)
                 sigma_init = self.config.sigma_fn(time_schedule[0])
                 x = x * sigma_init
+
                 for i in range(len(time_schedule) - 1):
                     t_curr = time_schedule[i] * torch.ones(x.shape[0]).to(x)
                     t_next = time_schedule[i + 1] * torch.ones(x.shape[0]).to(x)
-                    x = self.integration_step(
-                        x,
-                        t_curr,
-                        t_next,
-                        y,
-                        guidance,
-                        method='euler_maruyama',
-                        integrate_on_sigma=integrate_on_sigma,
-                        noise_injection=True
-                    )
-                    sigma = broadcast_from_below(self.config.sigma_fn(t_next), x_orig)
-                    alpha = broadcast_from_below(self.config.alpha_fn(t_next), x_orig)
 
-                    x_patch = alpha * x_orig + sigma * torch.randn_like(x_orig)
-                    x = (1 - mask) * x + mask * x_patch
+                    # Resample loop (RePaint-style jump back)
+                    for r in range(resample_steps + 1):
+                        x = self.integration_step(
+                            x,
+                            t_curr,
+                            t_next,
+                            y,
+                            guidance,
+                            method='euler_maruyama',
+                            integrate_on_sigma=integrate_on_sigma,
+                            noise_injection=True
+                        )
+                        sigma = broadcast_from_below(self.config.sigma_fn(t_next), x_orig)
+                        alpha = broadcast_from_below(self.config.alpha_fn(t_next), x_orig)
+
+                        x_patch = alpha * x_orig + sigma * torch.randn_like(x_orig)
+                        x = (1 - soft_mask) * x + soft_mask * x_patch
+
+                        # Jump back if not last resample iteration and not at final timestep
+                        if r < resample_steps and i + jump_length < len(time_schedule) - 1:
+                            # Jump back by adding noise
+                            t_jump = time_schedule[i]  # Jump back to current timestep
+                            sigma_jump = broadcast_from_below(
+                                self.config.sigma_fn(t_jump), x
+                            )
+                            alpha_jump = broadcast_from_below(
+                                self.config.alpha_fn(t_jump), x
+                            )
+                            # Re-noise the sample
+                            x = alpha_jump * x + sigma_jump * torch.randn_like(x)
+                            # Also update the patch for the jumped state
+                            x_patch_jump = alpha_jump * x_orig + sigma_jump * torch.randn_like(x_orig)
+                            x = (1 - soft_mask) * x + soft_mask * x_patch_jump
+
                 x = self.initial_norm.unnorm(x)
                 return x
+
+    def _create_soft_mask(
+        self,
+        mask: Float[Tensor, "*shape"],  # noqa: F821
+        falloff: int
+    ) -> Float[Tensor, "*shape"]:  # noqa: F821
+        """
+        Create a soft mask with cosine falloff at the boundary.
+
+        Args:
+            mask: Binary mask (1 = known, 0 = unknown)
+            falloff: Width of the gradient transition zone in voxels
+
+        Returns:
+            Soft mask with smooth transition at boundaries
+        """
+        if falloff <= 0:
+            return mask
+
+        # Use average pooling to create distance-like field, then rescale
+        # This is a simple approximation that works for 3D data
+        import torch.nn.functional as F
+
+        # Determine spatial dimensions (assume first dim is channels)
+        ndim = mask.dim() - 1  # Number of spatial dimensions
+
+        # Expand mask for pooling (need batch dim)
+        m = mask.unsqueeze(0).float()  # [1, C, ...]
+
+        # Apply average pooling to get approximate distance field
+        kernel_size = 2 * falloff + 1
+        padding = falloff
+
+        if ndim == 3:
+            # 3D case
+            m_dilated = F.avg_pool3d(
+                m, kernel_size=kernel_size, stride=1, padding=padding
+            )
+            m_eroded = F.avg_pool3d(
+                1 - m, kernel_size=kernel_size, stride=1, padding=padding
+            )
+        elif ndim == 2:
+            # 2D case
+            m_dilated = F.avg_pool2d(
+                m, kernel_size=kernel_size, stride=1, padding=padding
+            )
+            m_eroded = F.avg_pool2d(
+                1 - m, kernel_size=kernel_size, stride=1, padding=padding
+            )
+        else:
+            # Fallback: no soft mask for other dimensions
+            return mask
+
+        # Create soft mask: 1 in known region, 0 in unknown, gradient at boundary
+        # Use the pooled values to create smooth transition
+        soft_mask = m_dilated / (m_dilated + m_eroded + 1e-8)
+
+        # Apply cosine smoothing for nicer transition
+        soft_mask = (1 - torch.cos(soft_mask * np.pi)) / 2
+
+        return soft_mask.squeeze(0)  # Remove batch dim
 
     def integrate_flow_field(
         self,
