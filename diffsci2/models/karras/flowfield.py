@@ -1,5 +1,5 @@
 from typing import Literal, Callable, Any
-from jaxtyping import Float, Bool
+from jaxtyping import Float
 from torch import Tensor
 
 import warnings
@@ -678,12 +678,12 @@ class SIModule(lightning.LightningModule):
         return [self.optimizer], [lr_scheduler_config]
 
     def get_flow_field(
-            self,
-            x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
-            t: Float[Tensor, "batch"],  # noqa: F821, typing
-            guidance: float = 1.0,
-            y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing,
-            integrate_on_sigma: bool = False
+        self,
+        x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+        t: Float[Tensor, "batch"],  # noqa: F821, typing
+        guidance: float = 1.0,
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing,
+        integrate_on_sigma: bool = False
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
         if guidance == 1.0 or y is None:  # Implictly no guidance
             flow_field = self.config.preconditioner(self.model, x_noised, t, y=y)
@@ -718,6 +718,22 @@ class SIModule(lightning.LightningModule):
         score_field = ((alpha * flow_field - alpha_dot * x_noised) /
                        (sigma * (alpha_dot * sigma - alpha * sigma_dot)))
         return score_field
+
+    def get_denoised_estimate(
+        self,
+        x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+        t: Float[Tensor, "batch"],  # noqa: F821, typing
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
+        guidance: float = 1.0,
+        integrate_on_sigma: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
+        score_field = self.get_score_field(x_noised, t, y=y, guidance=guidance, integrate_on_sigma=integrate_on_sigma)
+        alpha, sigma = self.config.alpha_fn(t), self.config.sigma_fn(t)
+        alpha = broadcast_from_below(alpha, x_noised)
+        sigma = broadcast_from_below(sigma, x_noised)
+        epsilon = 1e-8
+        denoised_estimate = (x_noised + sigma**2 * score_field) / (alpha + epsilon)
+        return denoised_estimate
 
     def get_score_field_from_flow_field(
         self,
@@ -962,6 +978,287 @@ class SIModule(lightning.LightningModule):
         soft_mask = (1 - torch.cos(soft_mask * np.pi)) / 2
 
         return soft_mask.squeeze(0)  # Remove batch dim
+
+    # =========================================================================
+    # Diffusion Posterior Sampling (DPS)
+    # Based on: "Diffusion Posterior Sampling for General Noisy Inverse Problems"
+    # (Chung et al., ICLR 2023)
+    #
+    # General formulation for linear inverse problems: y = Ax + ε
+    # =========================================================================
+
+    def _compute_dps_gradient(
+        self,
+        x: Float[Tensor, "batch *shape"],  # noqa: F821
+        t: Float[Tensor, "batch"],  # noqa: F821
+        y: Float[Tensor, "*mshape"],  # noqa: F821
+        forward_operator: Callable[[Tensor], Tensor],
+        rho: float,
+        y_cond: None | dict = None,
+        guidance: float = 1.0
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        Compute DPS gradient via backpropagation through denoiser.
+
+        DPS gradient: -ρ · ∇_{x_t} ||y - A(x̂_0(x_t))||²
+
+        This requires backprop through the denoiser since x̂_0 is a function of x_t.
+
+        Args:
+            x: Current noisy state x_t [batch, *shape]
+            t: Current time [batch]
+            y: Observed measurement [*mshape]
+            forward_operator: Callable A(x) computing forward measurement
+            rho: Likelihood scaling (typically 1/η² where η is measurement noise)
+            y_cond: Optional conditioning for the model
+            guidance: Classifier-free guidance scale for denoiser
+
+        Returns:
+            DPS gradient: -ρ · ∇_{x_t} ||y - A(x̂_0)||² [batch, *shape]
+        """
+        # Must be called inside torch.enable_grad() context
+        x_for_grad = x.detach().requires_grad_(True)
+
+        # Compute denoised estimate x̂_0 = D(x_t, t)
+        x_hat = self.get_denoised_estimate(x_for_grad, t, y=y_cond, guidance=guidance)
+
+        # Apply forward operator: A(x̂_0)
+        pred = forward_operator(x_hat)
+
+        # Expand y to match pred shape if needed
+        if y.dim() < pred.dim():
+            y_expanded = y.unsqueeze(0).expand_as(pred)
+        else:
+            y_expanded = y
+
+        # Measurement loss: ||y - A(x̂_0)||²
+        loss = ((y_expanded - pred) ** 2).sum()
+
+        # Backprop to get gradient w.r.t. x_t
+        grad_x = torch.autograd.grad(loss, x_for_grad)[0]
+
+        # Return -ρ * gradient (negative because we want score, not loss gradient)
+        return -rho * grad_x
+
+    def sample_posterior_dps(
+        self,
+        measurement: Float[Tensor, "*mshape"],  # noqa: F821
+        forward_operator: Callable[[Tensor], Tensor],
+        shape: list[int],
+        nsamples: int = 1,
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821
+        guidance: float = 1.0,
+        nsteps: int = 50,
+        # DPS parameters
+        zeta: float = 1.0,
+        eta: float = 1.0,
+        jitter: bool = True,
+        grad_clip: float = 1.0,
+        # Integration parameters
+        method: Literal['euler', 'heun'] = 'heun',
+        # Schedule parameters
+        rho: float = 7.0,
+        # Output options
+        return_trajectory: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        Sample from posterior p(x|y) via Diffusion Posterior Sampling (DPS).
+
+        General method for inverse problems: y = A(x) + ε
+
+        DPS modifies the reverse diffusion process by adding a guidance term:
+            x_{t-1} = x_{t-1}^{uncond} + ζ · (-ρ · ∇_{x_t} ||y - A(x̂_0)||²)
+
+        where x̂_0 is the denoised estimate, and ρ = 1/η².
+
+        Args:
+            measurement: Observed measurement y [*mshape] (should be normalized)
+            forward_operator: Callable A(x) computing forward measurement
+            shape: Shape of x to generate (without batch dimension)
+            nsamples: Number of samples to generate
+            y: Optional conditioning for the diffusion model
+            guidance: Classifier-free guidance scale
+
+            nsteps: Number of diffusion steps
+
+            zeta: DPS guidance strength (ζ). Higher = stronger constraint.
+            eta: Measurement noise std (η). ρ = 1/η² scales the likelihood.
+            jitter: If True, add η noise to measurement each step.
+            grad_clip: Max norm for DPS gradient clipping. Prevents explosion.
+
+            method: Integration method ('euler' or 'heun')
+
+            rho: Power-law exponent for time schedule
+
+            return_trajectory: If True, return (samples, trajectory) tuple
+
+        Returns:
+            Samples from approximate posterior p(x|y) [batch, *shape]
+        """
+        device = self.device
+        measurement = measurement.to(device)
+        if y is not None:
+            y = dict_to(y, device)
+
+        # Likelihood scaling: ρ = 1/η²
+        rho_likelihood = 1.0 / (eta ** 2)
+
+        # Initialize with random noise
+        x = torch.randn(nsamples, *shape, device=device)
+
+        # Get time schedule and scale initial noise
+        time_schedule = self.create_time_schedule(nsteps, rho=rho).to(device)
+        sigma_init = self.config.sigma_fn(time_schedule[0])
+        x = x * sigma_init
+
+        trajectory = [x.clone()] if return_trajectory else None
+
+        # DPS Integration Loop
+        for i in range(len(time_schedule) - 1):
+            t_curr = time_schedule[i] * torch.ones(nsamples, device=device)
+            t_next = time_schedule[i + 1] * torch.ones(nsamples, device=device)
+
+            # Compute dt
+            dt = t_next - t_curr
+            dt = broadcast_from_below(dt, x)
+
+            # Standard flow field step - no gradients needed
+            with torch.no_grad():
+                if method == 'euler':
+                    v = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
+                    x_next = x + dt * v
+                elif method == 'heun':
+                    v1 = self.get_flow_field(x, t_curr, y=y, guidance=guidance)
+                    x_euler = x + dt * v1
+                    v2 = self.get_flow_field(x_euler, t_next, y=y, guidance=guidance)
+                    x_next = x + dt * (v1 + v2) / 2
+                else:
+                    raise ValueError(f"Invalid method: {method}")
+
+            # DPS gradient - requires backprop through denoiser
+            if jitter:
+                y_jittered = measurement + eta * torch.randn_like(measurement)
+            else:
+                y_jittered = measurement
+
+            with torch.enable_grad():
+                dps_grad = self._compute_dps_gradient(
+                    x, t_curr, y_jittered, forward_operator,
+                    rho=rho_likelihood, y_cond=y, guidance=guidance
+                )
+
+            # Clip gradient to prevent explosion
+            grad_norm = dps_grad.norm()
+            if grad_norm > grad_clip:
+                dps_grad = dps_grad * (grad_clip / grad_norm)
+
+            # Update
+            x = x_next + zeta * dps_grad
+
+            if return_trajectory:
+                trajectory.append(x.clone())
+
+        # Denormalize output
+        x = self.initial_norm.unnorm(x)
+
+        if return_trajectory:
+            trajectory = [self.initial_norm.unnorm(t) for t in trajectory]
+            return x, trajectory
+
+        return x
+
+    def inpaint_dps(
+        self,
+        x_orig: Float[Tensor, "*shape"],  # noqa: F821
+        mask: Float[Tensor, "*shape"],  # noqa: F821
+        nsamples: int = 1,
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821
+        guidance: float = 1.0,
+        nsteps: int = 50,
+        # DPS parameters
+        zeta: float = 1.0,
+        eta: float = 1.0,
+        jitter: bool = True,
+        grad_clip: float = 1.0,
+        # Integration parameters
+        method: Literal['euler', 'heun'] = 'heun',
+        # Mask parameters
+        mask_falloff: int = 0,
+        # Schedule parameters
+        rho: float = 7.0,
+        # Output options
+        return_trajectory: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        Inpainting via Diffusion Posterior Sampling (DPS).
+
+        Convenience wrapper around sample_posterior_dps for the inpainting
+        case where the forward operator is mask projection.
+
+        Args:
+            x_orig: Original data with known regions [*shape]
+            mask: Binary mask, 1=known, 0=unknown [*shape]
+            nsamples: Number of samples to generate
+            y: Optional conditioning for the diffusion model
+            guidance: Classifier-free guidance scale
+
+            nsteps: Number of diffusion steps
+
+            zeta: DPS guidance strength (ζ). Higher = stronger constraint.
+            eta: Measurement noise std (η) in y = Mx + ε, ε ~ N(0, η²I).
+                 Used in likelihood score scaling (ρ = 1/η²).
+            jitter: If True, add η noise to known pixels each step.
+            grad_clip: Max norm for DPS gradient clipping. Prevents explosion.
+
+            method: Integration method ('euler' or 'heun')
+
+            mask_falloff: Soft mask gradient width (0 = hard mask)
+
+            rho: Power-law exponent for time schedule
+
+            return_trajectory: If True, return (samples, trajectory) tuple
+
+        Returns:
+            Inpainted samples [batch, *shape]
+        """
+        warnings.warn("Assuming latent space operation for DPS inpainting")
+
+        device = self.device
+        x_orig = x_orig.to(device)
+        mask = mask.to(device)
+
+        # Create soft mask if specified
+        if mask_falloff > 0:
+            soft_mask = self._create_soft_mask(mask, mask_falloff)
+        else:
+            soft_mask = mask
+
+        # Normalize x_orig and create measurement
+        x_orig_normed = self.initial_norm(x_orig.unsqueeze(0)).squeeze(0)  # [*shape]
+        measurement = soft_mask * x_orig_normed
+
+        # Forward operator for inpainting: A(x) = mask * x
+        def forward_operator(x):
+            mask_expanded = soft_mask.unsqueeze(0).expand_as(x)
+            return mask_expanded * x
+
+        # Call general DPS method
+        return self.sample_posterior_dps(
+            measurement=measurement,
+            forward_operator=forward_operator,
+            shape=list(x_orig.shape),
+            nsamples=nsamples,
+            y=y,
+            guidance=guidance,
+            nsteps=nsteps,
+            zeta=zeta,
+            eta=eta,
+            jitter=jitter,
+            grad_clip=grad_clip,
+            method=method,
+            rho=rho,
+            return_trajectory=return_trajectory
+        )
 
     def integrate_flow_field(
         self,
