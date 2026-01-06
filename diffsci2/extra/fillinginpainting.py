@@ -303,14 +303,10 @@ def sample_grid_volume(
     y: None | dict[str, torch.Tensor] | np.ndarray = None,
     guidance: float = 1.0,
     nsteps: int = 30,
-    integrate_on_sigma: bool = False,
-    noise_injection: bool = False,
     blend_mode: Literal['latest', 'cosine'] = 'latest',
     periodicity: list[bool] = [False, False, False],
-    mask_falloff: int = 0,
-    resample_steps: int = 0,
-    jump_length: int = 1,
-    **kwargs
+    inpaint_method: Literal['inpaint', 'inpaint_dps', 'inpaint_lanpaint'] = 'inpaint_dps',
+    inpaint_kwargs: dict | None = None,
 ) -> Float[Tensor, "batch *final_shape"]:
     """
     Generate large volumes by tiling smaller cubes in a grid pattern using inpainting.
@@ -323,13 +319,13 @@ def sample_grid_volume(
         y: Optional condition tensor
         guidance: Guidance scale for conditional generation
         nsteps: Number of integration steps
-        integrate_on_sigma: Whether to integrate on sigma
-        noise_injection: Whether to inject noise during integration
         blend_mode: How to handle overlaps ('latest' or 'cosine')
-        mask_falloff: Soft mask gradient width (0 = hard mask)
-        resample_steps: Number of resample iterations (RePaint-style)
-        jump_length: Steps to jump back when resampling
-        **kwargs: Additional arguments passed to sample() and inpaint()
+        periodicity: [periodic_x, periodic_y, periodic_z] - whether each dimension wraps
+        inpaint_method: Which inpainting algorithm to use:
+            - 'inpaint': Original replacement-based
+            - 'inpaint_dps': Diffusion Posterior Sampling (default)
+            - 'inpaint_lanpaint': Langevin dynamics (experimental)
+        inpaint_kwargs: Additional kwargs passed to the inpainting function
 
     Returns:
         Generated volume tensor of shape [1, channels, final_dx, final_dy, final_dz]
@@ -389,8 +385,6 @@ def sample_grid_volume(
                 guidance=guidance,
                 nsteps=nsteps,
                 is_latent_shape=True,
-                integrate_on_sigma=integrate_on_sigma,
-                noise_injection=noise_injection,
                 orig_noise=noise_slice,
                 return_latents=True,
             )
@@ -408,19 +402,15 @@ def sample_grid_volume(
             x_orig = periodic_getitem(volume[0], slice(None), sx, sy, sz)
 
             # Use inpainting
-            generated_cube = flow_module.inpaint(
+            inpaint_fn = getattr(flow_module, inpaint_method)
+            generated_cube = inpaint_fn(
                 x_orig=x_orig,
                 mask=mask,
                 nsamples=1,
                 y=y[grid_pos[0], grid_pos[1], grid_pos[2]],
                 guidance=guidance,
                 nsteps=nsteps,
-                integrate_on_sigma=integrate_on_sigma,
-                noise_injection=noise_injection,
-                orig_noise=noise_slice,  # Remove batch dim for inpaint
-                mask_falloff=mask_falloff,
-                resample_steps=resample_steps,
-                jump_length=jump_length,
+                **(inpaint_kwargs or {}),
             )
 
         # inpaint returns [batch, *shape], remove batch dim if needed

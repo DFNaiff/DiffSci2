@@ -3,6 +3,7 @@ from jaxtyping import Float
 from torch import Tensor
 
 import warnings
+import math
 
 import torch
 import torch.nn as nn
@@ -1258,6 +1259,585 @@ class SIModule(lightning.LightningModule):
             method=method,
             rho=rho,
             return_trajectory=return_trajectory
+        )
+
+    # =========================================================================
+    # LanPaint: Training-Free Diffusion Inpainting via Langevin Dynamics
+    # Based on: "Training-Free Diffusion Model Inpainting via Langevin Sampling"
+    #
+    # Key insight: Sample from a tractable surrogate distribution
+    # q_{λ,σ}(x,y) ∝ p_σ(x,y) · exp(-λ/(2σ²)||y - α(σ)y₀||²)
+    # using Langevin dynamics with the "BiG score".
+    #
+    # Unlike DPS, no autograd through denoiser is needed.
+    # =========================================================================
+
+    def _compute_big_score(
+        self,
+        x: Float[Tensor, "batch *shape"],  # noqa: F821
+        t: Float[Tensor, "batch"],  # noqa: F821
+        y_0: Float[Tensor, "*shape"],  # noqa: F821
+        unknown_mask: Float[Tensor, "*shape"],  # noqa: F821
+        lambda_: float,
+        sigma_min: float = 0.02,
+        y_cond: None | dict = None,
+        guidance: float = 1.0,
+        debug: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        Compute BiG (Bidirectional Guidance) score for LanPaint.
+
+        For unknown pixels (M=1): s_model
+        For known pixels (M=0): -λ * s_model + (1 + λ) * s_prior
+
+        Where s_prior = ∇log p(y_t|y_0) = (α·y₀ - x) / σ² is the score of
+        the transition kernel N(α·y₀, σ²·I).
+
+        Args:
+            x: Current noisy state [batch, *shape]
+            t: Time [batch]
+            y_0: Clean known pixel values (normalized) [*shape]
+            unknown_mask: 1=unknown (to inpaint), 0=known (observed) [*shape]
+            lambda_: Guidance strength
+            sigma_min: (unused, kept for API compatibility)
+            y_cond: Optional conditioning dict for the model
+            guidance: Classifier-free guidance scale
+
+        Returns:
+            BiG score [batch, *shape]
+        """
+        if debug:
+            print(f"  [BiG] x: min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
+
+        # Get model score (no autograd needed)
+        with torch.no_grad():
+            s_model = self.get_score_field(x, t, y=y_cond, guidance=guidance)
+
+        if debug:
+            print(f"  [BiG] s_model: min={s_model.min():.4f}, max={s_model.max():.4f}, nan={s_model.isnan().any()}")
+
+        # Get sigma and alpha
+        sigma = self.config.sigma_fn(t)
+        alpha = self.config.alpha_fn(t)
+        sigma = broadcast_from_below(sigma, x)
+        alpha = broadcast_from_below(alpha, x)
+
+        if debug:
+            print(f"  [BiG] sigma: min={sigma.min():.4f}, max={sigma.max():.4f}")
+            print(f"  [BiG] alpha: min={alpha.min():.4f}, max={alpha.max():.4f}")
+
+        # Prior score: ∇log p(y_t|y_0) = (α·y₀ - x) / σ²
+        # This is the score of the transition kernel N(α·y₀, σ²·I)
+        s_prior = (alpha * y_0 - x) / (sigma ** 2)
+
+        if debug:
+            print(f"  [BiG] s_prior: min={s_prior.min():.4f}, max={s_prior.max():.4f}, nan={s_prior.isnan().any()}")
+
+        # Known mask (1-M where M=unknown_mask)
+        known_mask = 1.0 - unknown_mask
+
+        # BiG score:
+        # - Unknown (M=1): s_model
+        # - Known (M=0): -λ * s_model + (1 + λ) * s_prior
+        score_unknown = s_model
+        score_known = -lambda_ * s_model + (1 + lambda_) * s_prior
+
+        result = unknown_mask * score_unknown + known_mask * score_known
+
+        if debug:
+            print(f"  [BiG] score_unknown: min={score_unknown.min():.4f}, max={score_unknown.max():.4f}")
+            print(f"  [BiG] score_known: min={score_known.min():.4f}, max={score_known.max():.4f}")
+            print(f"  [BiG] result: min={result.min():.4f}, max={result.max():.4f}, nan={result.isnan().any()}")
+
+        return result
+
+    def _langevin_step_overdamped(
+        self,
+        x: Float[Tensor, "batch *shape"],  # noqa: F821
+        big_score: Float[Tensor, "batch *shape"],  # noqa: F821
+        h: float
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        One step of overdamped Langevin dynamics.
+
+        x ← x + h · s_BiG + √(2h) · ξ,   ξ ~ N(0, I)
+
+        Args:
+            x: Current state [batch, *shape]
+            big_score: BiG score at current state [batch, *shape]
+            h: Step size
+
+        Returns:
+            Updated state [batch, *shape]
+        """
+        noise = torch.randn_like(x)
+        return x + h * big_score + math.sqrt(2 * h) * noise
+
+    def _langevin_step_fld(
+        self,
+        x: Float[Tensor, "batch *shape"],  # noqa: F821
+        v: Float[Tensor, "batch *shape"],  # noqa: F821
+        big_score: Float[Tensor, "batch *shape"],  # noqa: F821
+        sigma: Float[Tensor, "batch"],  # noqa: F821
+        h: float,
+        Gamma: float,
+        sigma_min: float = 0.02,
+        debug: bool = False
+    ) -> tuple[Float[Tensor, "batch *shape"], Float[Tensor, "batch *shape"]]:  # noqa: F821
+        """
+        One step of Fast Langevin Dynamics (underdamped with momentum).
+
+        Uses diffusion damping A = 1/σ² for stability with large step sizes.
+
+        Decompose score: s = C - A·x, where C = s + A·x
+        The linear damping term -A·x provides a restoring force.
+
+        Args:
+            x: Current position [batch, *shape]
+            v: Current momentum [batch, *shape]
+            big_score: BiG score at current position [batch, *shape]
+            sigma: Current noise level [batch] (scalar broadcasted)
+            h: Step size
+            Gamma: Friction coefficient
+            sigma_min: (unused, kept for API compatibility)
+
+        Returns:
+            (x_new, v_new): Updated position and momentum
+        """
+        sigma = broadcast_from_below(sigma, x)
+
+        # Diffusion damping coefficient
+        A = 1.0 / (sigma ** 2)
+
+        if debug:
+            print(f"    [FLD] A (1/σ²): min={A.min():.4f}, max={A.max():.4f}")
+
+        # Decompose: s = C - A*x, so C = s + A*x
+        C = big_score + A * x
+
+        if debug:
+            print(f"    [FLD] C: min={C.min():.4f}, max={C.max():.4f}, nan={C.isnan().any()}")
+
+        # Decay factor
+        exp_Gh = math.exp(-Gamma * h)
+
+        if debug:
+            print(f"    [FLD] exp(-Γh): {exp_Gh:.6f}, Gamma={Gamma}, h={h}")
+
+        # Momentum update
+        noise_v = torch.randn_like(v)
+
+        # v_drift = exp(-Γh) v + (1-exp(-Γh))/Γ · (C - A·x)
+        v_drift = exp_Gh * v + (1 - exp_Gh) * (C - A * x) / Gamma
+
+        if debug:
+            print(f"    [FLD] v_drift: min={v_drift.min():.4f}, max={v_drift.max():.4f}, nan={v_drift.isnan().any()}")
+
+        # Add stochastic term: √(Γ(1-exp(-2Γh))) · ξ
+        noise_scale = math.sqrt(Gamma * (1 - exp_Gh**2))
+        v_new = v_drift + noise_scale * noise_v
+
+        if debug:
+            print(f"    [FLD] noise_scale: {noise_scale:.6f}")
+            print(f"    [FLD] v_new: min={v_new.min():.4f}, max={v_new.max():.4f}, nan={v_new.isnan().any()}")
+
+        # Position update (trapezoidal integration)
+        x_new = x + h * (v + v_new) / 2
+
+        if debug:
+            print(f"    [FLD] x_new: min={x_new.min():.4f}, max={x_new.max():.4f}, nan={x_new.isnan().any()}")
+
+        return x_new, v_new
+
+    def _diffusion_step_lanpaint(
+        self,
+        x: Float[Tensor, "batch *shape"],  # noqa: F821
+        t_curr: Float[Tensor, "batch"],  # noqa: F821
+        t_next: Float[Tensor, "batch"],  # noqa: F821
+        y_cond: None | dict = None,
+        guidance: float = 1.0,
+        debug: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        DDIM-like diffusion step from t_curr to t_next.
+
+        This is a heuristic warm start for the next Langevin correction,
+        NOT exact transport of q_{λ,σ} to q_{λ,σ_next}.
+
+        Args:
+            x: Current state at t_curr [batch, *shape]
+            t_curr: Current time [batch]
+            t_next: Next time [batch] (t_next < t_curr, moving toward 0)
+            y_cond: Optional conditioning dict
+            guidance: Classifier-free guidance scale
+
+        Returns:
+            State at t_next [batch, *shape]
+        """
+        if debug:
+            print(f"  [Diff] x input: min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
+
+        with torch.no_grad():
+            # Get denoised estimate x̂_0
+            x_hat = self.get_denoised_estimate(x, t_curr, y=y_cond, guidance=guidance)
+
+        if debug:
+            print(f"  [Diff] x_hat: min={x_hat.min():.4f}, max={x_hat.max():.4f}, nan={x_hat.isnan().any()}")
+
+        # Get sigma and alpha at current and next times
+        sigma_curr = self.config.sigma_fn(t_curr)
+        sigma_next = self.config.sigma_fn(t_next)
+        alpha_curr = self.config.alpha_fn(t_curr)
+        alpha_next = self.config.alpha_fn(t_next)
+
+        sigma_curr = broadcast_from_below(sigma_curr, x)
+        sigma_next = broadcast_from_below(sigma_next, x)
+        alpha_curr = broadcast_from_below(alpha_curr, x)
+        alpha_next = broadcast_from_below(alpha_next, x)
+
+        if debug:
+            print(f"  [Diff] sigma_curr={sigma_curr.mean():.4f}, sigma_next={sigma_next.mean():.4f}")
+
+        # Estimate noise: x = α·x̂_0 + σ·ε → ε = (x - α·x̂_0) / σ
+        eps = (x - alpha_curr * x_hat) / (sigma_curr + 1e-8)
+
+        if debug:
+            print(f"  [Diff] eps: min={eps.min():.4f}, max={eps.max():.4f}, nan={eps.isnan().any()}")
+
+        # Reconstruct at next noise level
+        x_next = alpha_next * x_hat + sigma_next * eps
+
+        if debug:
+            print(f"  [Diff] x_next: min={x_next.min():.4f}, max={x_next.max():.4f}, nan={x_next.isnan().any()}")
+
+        return x_next
+
+    def _langevin_correction(
+        self,
+        x: Float[Tensor, "batch *shape"],  # noqa: F821
+        t: Float[Tensor, "batch"],  # noqa: F821
+        y_0: Float[Tensor, "*shape"],  # noqa: F821
+        unknown_mask: Float[Tensor, "*shape"],  # noqa: F821
+        lambda_: float,
+        K: int,
+        h: float,
+        Gamma: float,
+        use_fld: bool = True,
+        sigma_min: float = 0.02,
+        max_score: float | None = None,
+        y_cond: None | dict = None,
+        guidance: float = 1.0,
+        debug: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        Run K Langevin steps at fixed noise level to sample from q_{λ,σ}.
+
+        Args:
+            x: Initial state [batch, *shape]
+            t: Time (fixed during Langevin steps) [batch]
+            y_0: Clean known pixel values (normalized) [*shape]
+            unknown_mask: 1=unknown, 0=known [*shape]
+            lambda_: Guidance strength
+            K: Number of Langevin steps
+            h: Step size
+            Gamma: FLD friction coefficient
+            use_fld: If True, use Fast Langevin Dynamics; else overdamped
+            sigma_min: Minimum sigma for stability (prevents division explosion)
+            max_score: If set, clamp score magnitude to prevent explosion
+            y_cond: Optional conditioning dict
+            guidance: Classifier-free guidance scale
+
+        Returns:
+            State after K Langevin steps [batch, *shape]
+        """
+        sigma = self.config.sigma_fn(t)
+
+        if use_fld:
+            # Initialize momentum from stationary distribution
+            v = math.sqrt(Gamma) * torch.randn_like(x)
+
+        for k in range(K):
+            if debug:
+                print(f"  [Lang] Step {k}: x min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
+
+            # Compute BiG score (passes sigma_min for clipping)
+            big_score = self._compute_big_score(
+                x, t, y_0, unknown_mask, lambda_,
+                sigma_min=sigma_min, y_cond=y_cond, guidance=guidance, debug=debug
+            )
+
+            # Option 1: Clamp score magnitude to prevent explosion
+            if max_score is not None:
+                score_norm = big_score.abs().max()
+                if debug and score_norm > max_score:
+                    print(f"  [Lang] Clamping score from {score_norm:.4f} to {max_score}")
+                big_score = torch.clamp(big_score, -max_score, max_score)
+
+            if use_fld:
+                x, v = self._langevin_step_fld(x, v, big_score, sigma, h, Gamma,
+                                               sigma_min=sigma_min, debug=debug)
+            else:
+                x = self._langevin_step_overdamped(x, big_score, h)
+
+        return x
+
+    def sample_posterior_lanpaint(
+        self,
+        y_0: Float[Tensor, "*shape"],  # noqa: F821
+        unknown_mask: Float[Tensor, "*shape"],  # noqa: F821
+        nsamples: int = 1,
+        y: None | dict = None,
+        guidance: float = 1.0,
+        nsteps: int = 50,
+        # LanPaint parameters
+        lambda_: float = 6.0,
+        K: int = 5,
+        h: float = 0.3,
+        Gamma: float = 15.0,
+        use_fld: bool = True,
+        # Stability parameters
+        sigma_min: float = 0.02,
+        max_score: float | None = None,
+        # Schedule parameters
+        rho: float = 7.0,
+        # Output options
+        return_trajectory: bool = False,
+        debug: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        Sample from posterior p(x|y₀) via LanPaint (Langevin dynamics).
+
+        At each noise level σ:
+        1. Run K Langevin steps with BiG score to sample from q_{λ,σ}
+        2. Take diffusion step to next noise level (warm start)
+
+        The surrogate distribution q_{λ,σ} converges to true posterior as σ→0.
+
+        Args:
+            y_0: Known pixel values (normalized) [*shape]
+            unknown_mask: 1=unknown (to inpaint), 0=known (observed) [*shape]
+            nsamples: Number of samples to generate
+            y: Optional conditioning dict for the model
+            guidance: Classifier-free guidance scale
+
+            nsteps: Number of noise levels in schedule
+
+            lambda_: Guidance strength (λ). Higher = stronger constraint on known.
+                     Recommended: 4.0 - 10.0
+            K: Langevin steps per noise level. More = closer to q_{λ,σ}.
+               Recommended: 5 - 10
+            h: Langevin step size. Larger = faster but less accurate.
+               Recommended: 0.1 - 0.5
+            Gamma: FLD friction coefficient. Higher = more stable.
+                   Recommended: 10.0 - 20.0
+            use_fld: If True, use Fast Langevin Dynamics; False for overdamped
+
+            sigma_min: Minimum sigma for stability. Prevents λ/σ² explosion.
+                       Recommended: 0.01 - 0.05
+            max_score: If set, clamp score magnitude to this value.
+                       Prevents explosion from extreme gradients.
+
+            rho: Power-law exponent for time schedule
+
+            return_trajectory: If True, return (samples, trajectory)
+
+        Returns:
+            Samples from approximate posterior [batch, *shape]
+        """
+        device = self.device
+        y_0 = y_0.to(device)
+        unknown_mask = unknown_mask.to(device)
+        if y is not None:
+            y = dict_to(y, device)
+
+        shape = list(y_0.shape)
+
+        # Get time schedule
+        time_schedule = self.create_time_schedule(nsteps, rho=rho).to(device)
+        sigma_max = self.config.sigma_fn(time_schedule[0])
+        alpha_max = self.config.alpha_fn(time_schedule[0])
+
+        if debug:
+            print(f"[LanPaint] sigma_max={sigma_max:.4f}, alpha_max={alpha_max:.4f}, sigma_min={sigma_min:.4f}")
+            print(f"[LanPaint] lambda={lambda_}, K={K}, h={h}, Gamma={Gamma}, use_fld={use_fld}")
+            print(f"[LanPaint] y_0: min={y_0.min():.4f}, max={y_0.max():.4f}")
+            print(f"[LanPaint] unknown_mask: sum={unknown_mask.sum()}, total={unknown_mask.numel()}")
+
+        # Initialize from noise at sigma_max
+        x = torch.randn(nsamples, *shape, device=device) * sigma_max
+
+        # Set known pixels to noisy version of y_0: α(σ_max)·y_0 + σ_max·ξ
+        known_mask = 1.0 - unknown_mask
+        y_noisy = alpha_max * y_0 + sigma_max * torch.randn_like(y_0)
+        x = unknown_mask * x + known_mask * y_noisy
+
+        if debug:
+            print(f"[LanPaint] Initial x: min={x.min():.4f}, max={x.max():.4f}")
+
+        trajectory = [x.clone()] if return_trajectory else None
+
+        # Main loop: iterate through noise levels
+        for i in range(len(time_schedule) - 1):
+            t_curr = time_schedule[i] * torch.ones(nsamples, device=device)
+            t_next = time_schedule[i + 1] * torch.ones(nsamples, device=device)
+            sigma_curr = self.config.sigma_fn(t_curr[0])
+
+            if debug:
+                print(f"\n[LanPaint] === Step {i}/{len(time_schedule)-1}, t={t_curr[0]:.4f}, sigma={sigma_curr:.4f} ===")
+                print(f"[LanPaint] x before Langevin: min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
+
+            # Step 1: Langevin correction at current noise level
+            x = self._langevin_correction(
+                x, t_curr, y_0, unknown_mask, lambda_,
+                K, h, Gamma, use_fld, sigma_min=sigma_min, max_score=max_score,
+                y_cond=y, guidance=guidance, debug=debug
+            )
+
+            if debug:
+                print(f"[LanPaint] x after Langevin: min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
+
+            # Step 2: Diffusion step to next noise level (warm start)
+            x = self._diffusion_step_lanpaint(x, t_curr, t_next, y_cond=y, guidance=guidance, debug=debug)
+
+            if debug:
+                print(f"[LanPaint] x after diffusion: min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
+
+            if return_trajectory:
+                trajectory.append(x.clone())
+
+            # Early termination if NaN detected
+            if x.isnan().any():
+                print(f"[LanPaint] ERROR: NaN detected at step {i}, terminating early")
+                break
+
+        # Final Langevin correction (skip if sigma is already at minimum)
+        if not x.isnan().any():
+            t_final = time_schedule[-1] * torch.ones(nsamples, device=device)
+            sigma_final = self.config.sigma_fn(t_final[0]).item()
+
+            if sigma_final >= sigma_min:
+                if debug:
+                    print(f"\n[LanPaint] === Final Langevin correction, t={t_final[0]:.4f}, sigma={sigma_final:.4f} ===")
+                x = self._langevin_correction(
+                    x, t_final, y_0, unknown_mask, lambda_,
+                    K, h, Gamma, use_fld, sigma_min=sigma_min, max_score=max_score,
+                    y_cond=y, guidance=guidance, debug=debug
+                )
+            else:
+                if debug:
+                    print(f"\n[LanPaint] === Skipping final Langevin (sigma={sigma_final:.4f} < sigma_min={sigma_min:.4f}) ===")
+
+        # Denormalize output
+        x = self.initial_norm.unnorm(x)
+
+        if return_trajectory:
+            trajectory.append(x.clone())
+            trajectory = [self.initial_norm.unnorm(t) for t in trajectory[:-1]] + [trajectory[-1]]
+            return x, trajectory
+
+        return x
+
+    def inpaint_lanpaint(
+        self,
+        x_orig: Float[Tensor, "*shape"],  # noqa: F821
+        mask: Float[Tensor, "*shape"],  # noqa: F821
+        nsamples: int = 1,
+        y: None | dict = None,
+        guidance: float = 1.0,
+        nsteps: int = 50,
+        # LanPaint parameters
+        lambda_: float = 6.0,
+        K: int = 5,
+        h: float = 0.3,
+        Gamma: float = 15.0,
+        use_fld: bool = True,
+        # Stability parameters
+        sigma_min: float = 0.02,
+        max_score: float | None = None,
+        # Mask parameters
+        mask_falloff: int = 0,
+        # Schedule parameters
+        rho: float = 7.0,
+        # Output options
+        return_trajectory: bool = False,
+        debug: bool = False
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        Inpainting via LanPaint (Langevin dynamics).
+
+        Convenience wrapper around sample_posterior_lanpaint.
+
+        Args:
+            x_orig: Original data with known regions [*shape]
+            mask: Binary mask, 1=known, 0=unknown [*shape]
+                  (Same convention as inpaint_dps)
+            nsamples: Number of samples to generate
+            y: Optional conditioning dict for the model
+            guidance: Classifier-free guidance scale
+
+            nsteps: Number of noise levels
+
+            lambda_: Guidance strength (λ). Recommended: 4.0 - 10.0
+            K: Langevin steps per noise level. Recommended: 5 - 10
+            h: Langevin step size. Recommended: 0.1 - 0.5
+            Gamma: FLD friction coefficient. Recommended: 10.0 - 20.0
+            use_fld: If True, use Fast Langevin Dynamics; False for overdamped
+
+            sigma_min: Minimum sigma for stability. Prevents λ/σ² explosion.
+                       Recommended: 0.01 - 0.05
+            max_score: If set, clamp score magnitude to this value.
+                       Prevents explosion. Try 10.0 - 100.0.
+
+            mask_falloff: Soft mask gradient width (0 = hard mask)
+
+            rho: Power-law exponent for time schedule
+
+            return_trajectory: If True, return (samples, trajectory)
+
+        Returns:
+            Inpainted samples [batch, *shape]
+        """
+        warnings.warn("Assuming latent space operation for LanPaint inpainting")
+
+        device = self.device
+        x_orig = x_orig.to(device)
+        mask = mask.to(device)
+
+        # Create soft mask if specified
+        if mask_falloff > 0:
+            soft_mask = self._create_soft_mask(mask, mask_falloff)
+        else:
+            soft_mask = mask
+
+        # Normalize x_orig
+        x_orig_normed = self.initial_norm(x_orig.unsqueeze(0)).squeeze(0)
+
+        # y_0 = known pixel values (where mask=1)
+        # We pass the full normalized image; the algorithm uses known_mask to select
+        y_0 = x_orig_normed
+
+        # unknown_mask: 1=unknown, 0=known
+        # Our mask convention: 1=known, 0=unknown
+        # So unknown_mask = 1 - mask
+        unknown_mask = 1.0 - soft_mask
+
+        return self.sample_posterior_lanpaint(
+            y_0=y_0,
+            unknown_mask=unknown_mask,
+            nsamples=nsamples,
+            y=y,
+            guidance=guidance,
+            nsteps=nsteps,
+            lambda_=lambda_,
+            K=K,
+            h=h,
+            Gamma=Gamma,
+            use_fld=use_fld,
+            sigma_min=sigma_min,
+            max_score=max_score,
+            rho=rho,
+            return_trajectory=return_trajectory,
+            debug=debug
         )
 
     def integrate_flow_field(

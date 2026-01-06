@@ -88,13 +88,9 @@ def sample_sequential_z(
     y: None | dict[str, torch.Tensor] | np.ndarray | list = None,
     guidance: float = 1.0,
     nsteps: int = 30,
-    integrate_on_sigma: bool = False,
-    noise_injection: bool = True,
     blend_mode: Literal['cosine', 'latest'] = 'cosine',
-    mask_falloff: int = 0,
-    resample_steps: int = 0,
-    jump_length: int = 1,
-    **kwargs
+    inpaint_method: Literal['inpaint', 'inpaint_dps', 'inpaint_lanpaint'] = 'inpaint_dps',
+    inpaint_kwargs: dict | None = None,
 ) -> Float[Tensor, "batch channels dx dy final_dz"]:
     """
     Generate extended volumes by sequential inpainting along the z-direction.
@@ -122,12 +118,14 @@ def sample_sequential_z(
            - list/np.ndarray of length num_blocks: Per-block conditioning
         guidance: Guidance scale for conditional generation
         nsteps: Number of integration steps
-        integrate_on_sigma: Whether to integrate on sigma
-        noise_injection: Whether to inject noise during integration
         blend_mode: How to handle overlaps:
             - 'cosine': Smooth blending using cosine weights
             - 'latest': Simply overwrite with latest block
-        **kwargs: Additional arguments passed to sample() and inpaint()
+        inpaint_method: Which inpainting algorithm to use:
+            - 'inpaint': Original replacement-based
+            - 'inpaint_dps': Diffusion Posterior Sampling (default)
+            - 'inpaint_lanpaint': Langevin dynamics (experimental)
+        inpaint_kwargs: Additional kwargs passed to the inpainting function
 
     Returns:
         Generated volume tensor of shape [1, channels, dx, dy, final_dz]
@@ -209,8 +207,6 @@ def sample_sequential_z(
                 guidance=guidance,
                 nsteps=nsteps,
                 is_latent_shape=True,
-                integrate_on_sigma=integrate_on_sigma,
-                noise_injection=noise_injection,
                 return_latents=True,
             )
             # generated_block shape: [1, channels, dx, dy, extended_dz]
@@ -236,18 +232,15 @@ def sample_sequential_z(
             mask = _build_inpaint_mask_sequential(extended_shape, overlap_size, device)
             
             # Generate using inpainting
-            generated_block = flow_module.inpaint(
+            inpaint_fn = getattr(flow_module, inpaint_method)
+            generated_block = inpaint_fn(
                 x_orig=x_orig,
                 mask=mask,
                 nsamples=1,
                 y=conditions[i],
                 guidance=guidance,
                 nsteps=nsteps,
-                integrate_on_sigma=integrate_on_sigma,
-                noise_injection=noise_injection,
-                mask_falloff=mask_falloff,
-                resample_steps=resample_steps,
-                jump_length=jump_length,
+                **(inpaint_kwargs or {}),
             )
             generated_block = generated_block[0]  # Remove batch dim
 
