@@ -12,6 +12,7 @@ import lightning
 
 from diffsci2.torchutils import broadcast_from_below, dict_unsqueeze, dict_to
 from diffsci2.models.aux_scripts import DimensionAgnosticBatchNorm, ConstantBatchNorm, IdentityBatchNorm
+from diffsci2.models.karras.mcmc import get_stepper, MCMCStepper
 
 
 SampleType = Float[Tensor, "batch *shape"]
@@ -1351,103 +1352,8 @@ class SIModule(lightning.LightningModule):
 
         return result
 
-    def _langevin_step_overdamped(
-        self,
-        x: Float[Tensor, "batch *shape"],  # noqa: F821
-        big_score: Float[Tensor, "batch *shape"],  # noqa: F821
-        h: float
-    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
-        """
-        One step of overdamped Langevin dynamics.
-
-        x ← x + h · s_BiG + √(2h) · ξ,   ξ ~ N(0, I)
-
-        Args:
-            x: Current state [batch, *shape]
-            big_score: BiG score at current state [batch, *shape]
-            h: Step size
-
-        Returns:
-            Updated state [batch, *shape]
-        """
-        noise = torch.randn_like(x)
-        return x + h * big_score + math.sqrt(2 * h) * noise
-
-    def _langevin_step_fld(
-        self,
-        x: Float[Tensor, "batch *shape"],  # noqa: F821
-        v: Float[Tensor, "batch *shape"],  # noqa: F821
-        big_score: Float[Tensor, "batch *shape"],  # noqa: F821
-        sigma: Float[Tensor, "batch"],  # noqa: F821
-        h: float,
-        Gamma: float,
-        sigma_min: float = 0.02,
-        debug: bool = False
-    ) -> tuple[Float[Tensor, "batch *shape"], Float[Tensor, "batch *shape"]]:  # noqa: F821
-        """
-        One step of Fast Langevin Dynamics (underdamped with momentum).
-
-        Uses diffusion damping A = 1/σ² for stability with large step sizes.
-
-        Decompose score: s = C - A·x, where C = s + A·x
-        The linear damping term -A·x provides a restoring force.
-
-        Args:
-            x: Current position [batch, *shape]
-            v: Current momentum [batch, *shape]
-            big_score: BiG score at current position [batch, *shape]
-            sigma: Current noise level [batch] (scalar broadcasted)
-            h: Step size
-            Gamma: Friction coefficient
-            sigma_min: (unused, kept for API compatibility)
-
-        Returns:
-            (x_new, v_new): Updated position and momentum
-        """
-        sigma = broadcast_from_below(sigma, x)
-
-        # Diffusion damping coefficient
-        A = 1.0 / (sigma ** 2)
-
-        if debug:
-            print(f"    [FLD] A (1/σ²): min={A.min():.4f}, max={A.max():.4f}")
-
-        # Decompose: s = C - A*x, so C = s + A*x
-        C = big_score + A * x
-
-        if debug:
-            print(f"    [FLD] C: min={C.min():.4f}, max={C.max():.4f}, nan={C.isnan().any()}")
-
-        # Decay factor
-        exp_Gh = math.exp(-Gamma * h)
-
-        if debug:
-            print(f"    [FLD] exp(-Γh): {exp_Gh:.6f}, Gamma={Gamma}, h={h}")
-
-        # Momentum update
-        noise_v = torch.randn_like(v)
-
-        # v_drift = exp(-Γh) v + (1-exp(-Γh))/Γ · (C - A·x)
-        v_drift = exp_Gh * v + (1 - exp_Gh) * (C - A * x) / Gamma
-
-        if debug:
-            print(f"    [FLD] v_drift: min={v_drift.min():.4f}, max={v_drift.max():.4f}, nan={v_drift.isnan().any()}")
-
-        # Add stochastic term: √(Γ(1-exp(-2Γh))) · ξ
-        noise_scale = math.sqrt(Gamma * (1 - exp_Gh**2))
-        v_new = v_drift + noise_scale * noise_v
-
-        if debug:
-            print(f"    [FLD] noise_scale: {noise_scale:.6f}")
-            print(f"    [FLD] v_new: min={v_new.min():.4f}, max={v_new.max():.4f}, nan={v_new.isnan().any()}")
-
-        # Position update (trapezoidal integration)
-        x_new = x + h * (v + v_new) / 2
-
-        if debug:
-            print(f"    [FLD] x_new: min={x_new.min():.4f}, max={x_new.max():.4f}, nan={x_new.isnan().any()}")
-
-        return x_new, v_new
+    # MCMC step methods are now in diffsci2/models/karras/mcmc.py
+    # See: OverdampedLangevin, TamedULA, BAOAB, HMC, FLD, MALA
 
     def _diffusion_step_lanpaint(
         self,
@@ -1520,64 +1426,70 @@ class SIModule(lightning.LightningModule):
         unknown_mask: Float[Tensor, "*shape"],  # noqa: F821
         lambda_: float,
         K: int,
-        h: float,
-        Gamma: float,
-        use_fld: bool = True,
-        sigma_min: float = 0.02,
+        mcmc_method: str = "tamed_ula",
+        mcmc_args: dict | None = None,
         max_score: float | None = None,
         y_cond: None | dict = None,
         guidance: float = 1.0,
         debug: bool = False
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
         """
-        Run K Langevin steps at fixed noise level to sample from q_{λ,σ}.
+        Run K MCMC steps at fixed noise level to sample from q_{λ,σ}.
+
+        Uses the mcmc module for clean, modular MCMC stepping.
 
         Args:
             x: Initial state [batch, *shape]
-            t: Time (fixed during Langevin steps) [batch]
+            t: Time (fixed during MCMC steps) [batch]
             y_0: Clean known pixel values (normalized) [*shape]
             unknown_mask: 1=unknown, 0=known [*shape]
             lambda_: Guidance strength
-            K: Number of Langevin steps
-            h: Step size
-            Gamma: FLD friction coefficient
-            use_fld: If True, use Fast Langevin Dynamics; else overdamped
-            sigma_min: Minimum sigma for stability (prevents division explosion)
+            K: Number of MCMC steps (or trajectories for HMC)
+            mcmc_method: MCMC method. One of:
+                - "overdamped", "ula": Overdamped Langevin
+                - "tamed_ula", "tamed": Tamed ULA (default, stable)
+                - "mala": Metropolis-adjusted Langevin
+                - "baoab": BAOAB splitting (stable underdamped)
+                - "fld": Fast Langevin Dynamics
+                - "hmc": Hamiltonian Monte Carlo
+            mcmc_args: Method-specific arguments dict
             max_score: If set, clamp score magnitude to prevent explosion
             y_cond: Optional conditioning dict
             guidance: Classifier-free guidance scale
 
         Returns:
-            State after K Langevin steps [batch, *shape]
+            State after K MCMC steps [batch, *shape]
         """
-        sigma = self.config.sigma_fn(t)
+        mcmc_args = mcmc_args or {}
 
-        if use_fld:
-            # Initialize momentum from stationary distribution
-            v = math.sqrt(Gamma) * torch.randn_like(x)
+        # For FLD, we need to pass sigma
+        if mcmc_method.lower() == "fld":
+            sigma = self.config.sigma_fn(t)
+            mcmc_args = {**mcmc_args, "sigma": sigma.mean().item()}
 
+        # Create stepper
+        stepper = get_stepper(mcmc_method, **mcmc_args)
+
+        # Create score function closure
+        def score_fn(x_: Tensor) -> Tensor:
+            score = self._compute_big_score(
+                x_, t, y_0, unknown_mask, lambda_,
+                y_cond=y_cond, guidance=guidance, debug=False
+            )
+            # Optionally clamp score
+            if max_score is not None:
+                score = torch.clamp(score, -max_score, max_score)
+            return score
+
+        # Run K MCMC steps
         for k in range(K):
             if debug:
-                print(f"  [Lang] Step {k}: x min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
+                print(f"  [MCMC:{mcmc_method}] Step {k}: x min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
 
-            # Compute BiG score (passes sigma_min for clipping)
-            big_score = self._compute_big_score(
-                x, t, y_0, unknown_mask, lambda_,
-                sigma_min=sigma_min, y_cond=y_cond, guidance=guidance, debug=debug
-            )
+            x = stepper.step(x, score_fn)
 
-            # Option 1: Clamp score magnitude to prevent explosion
-            if max_score is not None:
-                score_norm = big_score.abs().max()
-                if debug and score_norm > max_score:
-                    print(f"  [Lang] Clamping score from {score_norm:.4f} to {max_score}")
-                big_score = torch.clamp(big_score, -max_score, max_score)
-
-            if use_fld:
-                x, v = self._langevin_step_fld(x, v, big_score, sigma, h, Gamma,
-                                               sigma_min=sigma_min, debug=debug)
-            else:
-                x = self._langevin_step_overdamped(x, big_score, h)
+            if debug:
+                print(f"  [MCMC:{mcmc_method}] After step {k}: x min={x.min():.4f}, max={x.max():.4f}")
 
         return x
 
@@ -1592,11 +1504,10 @@ class SIModule(lightning.LightningModule):
         # LanPaint parameters
         lambda_: float = 6.0,
         K: int = 5,
-        h: float = 0.3,
-        Gamma: float = 15.0,
-        use_fld: bool = True,
+        # MCMC parameters
+        mcmc_method: str = "tamed_ula",
+        mcmc_args: dict | None = None,
         # Stability parameters
-        sigma_min: float = 0.02,
         max_score: float | None = None,
         # Schedule parameters
         rho: float = 7.0,
@@ -1605,10 +1516,10 @@ class SIModule(lightning.LightningModule):
         debug: bool = False
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
         """
-        Sample from posterior p(x|y₀) via LanPaint (Langevin dynamics).
+        Sample from posterior p(x|y₀) via LanPaint with MCMC sampling.
 
         At each noise level σ:
-        1. Run K Langevin steps with BiG score to sample from q_{λ,σ}
+        1. Run K MCMC steps with BiG score to sample from q_{λ,σ}
         2. Take diffusion step to next noise level (warm start)
 
         The surrogate distribution q_{λ,σ} converges to true posterior as σ→0.
@@ -1624,16 +1535,24 @@ class SIModule(lightning.LightningModule):
 
             lambda_: Guidance strength (λ). Higher = stronger constraint on known.
                      Recommended: 4.0 - 10.0
-            K: Langevin steps per noise level. More = closer to q_{λ,σ}.
+            K: MCMC steps per noise level. More = closer to q_{λ,σ}.
                Recommended: 5 - 10
-            h: Langevin step size. Larger = faster but less accurate.
-               Recommended: 0.1 - 0.5
-            Gamma: FLD friction coefficient. Higher = more stable.
-                   Recommended: 10.0 - 20.0
-            use_fld: If True, use Fast Langevin Dynamics; False for overdamped
 
-            sigma_min: Minimum sigma for stability. Prevents λ/σ² explosion.
-                       Recommended: 0.01 - 0.05
+            mcmc_method: MCMC method to use. One of:
+                - "tamed_ula" (default): Tamed ULA, stable gradient bounding
+                - "overdamped", "ula": Overdamped Langevin
+                - "baoab": BAOAB splitting (stable underdamped)
+                - "hmc": Hamiltonian Monte Carlo
+                - "fld": Fast Langevin Dynamics
+                - "mala": Metropolis-Adjusted Langevin
+            mcmc_args: Method-specific arguments dict:
+                - tamed_ula: {"h": step_size (default 0.1)}
+                - overdamped: {"h": step_size (default 0.1)}
+                - baoab: {"h": step_size, "gamma": friction (default 1.0)}
+                - hmc: {"epsilon": leapfrog_step (default 0.01),
+                        "n_leapfrog": num_steps (default 10)}
+                - fld: {"h": step_size, "gamma": friction (default 15.0)}
+
             max_score: If set, clamp score magnitude to this value.
                        Prevents explosion from extreme gradients.
 
@@ -1644,6 +1563,7 @@ class SIModule(lightning.LightningModule):
         Returns:
             Samples from approximate posterior [batch, *shape]
         """
+        mcmc_args = mcmc_args or {}
         device = self.device
         y_0 = y_0.to(device)
         unknown_mask = unknown_mask.to(device)
@@ -1658,8 +1578,8 @@ class SIModule(lightning.LightningModule):
         alpha_max = self.config.alpha_fn(time_schedule[0])
 
         if debug:
-            print(f"[LanPaint] sigma_max={sigma_max:.4f}, alpha_max={alpha_max:.4f}, sigma_min={sigma_min:.4f}")
-            print(f"[LanPaint] lambda={lambda_}, K={K}, h={h}, Gamma={Gamma}, use_fld={use_fld}")
+            print(f"[LanPaint] sigma_max={sigma_max:.4f}, alpha_max={alpha_max:.4f}")
+            print(f"[LanPaint] lambda={lambda_}, K={K}, mcmc_method={mcmc_method}, mcmc_args={mcmc_args}")
             print(f"[LanPaint] y_0: min={y_0.min():.4f}, max={y_0.max():.4f}")
             print(f"[LanPaint] unknown_mask: sum={unknown_mask.sum()}, total={unknown_mask.numel()}")
 
@@ -1686,10 +1606,10 @@ class SIModule(lightning.LightningModule):
                 print(f"\n[LanPaint] === Step {i}/{len(time_schedule)-1}, t={t_curr[0]:.4f}, sigma={sigma_curr:.4f} ===")
                 print(f"[LanPaint] x before Langevin: min={x.min():.4f}, max={x.max():.4f}, nan={x.isnan().any()}")
 
-            # Step 1: Langevin correction at current noise level
+            # Step 1: MCMC correction at current noise level
             x = self._langevin_correction(
-                x, t_curr, y_0, unknown_mask, lambda_,
-                K, h, Gamma, use_fld, sigma_min=sigma_min, max_score=max_score,
+                x, t_curr, y_0, unknown_mask, lambda_, K,
+                mcmc_method=mcmc_method, mcmc_args=mcmc_args, max_score=max_score,
                 y_cond=y, guidance=guidance, debug=debug
             )
 
@@ -1710,22 +1630,22 @@ class SIModule(lightning.LightningModule):
                 print(f"[LanPaint] ERROR: NaN detected at step {i}, terminating early")
                 break
 
-        # Final Langevin correction (skip if sigma is already at minimum)
-        if not x.isnan().any():
-            t_final = time_schedule[-1] * torch.ones(nsamples, device=device)
-            sigma_final = self.config.sigma_fn(t_final[0]).item()
+        # # Final Langevin correction (skip if sigma is already at minimum)
+        # if not x.isnan().any():
+        #     t_final = time_schedule[-1] * torch.ones(nsamples, device=device)
+        #     sigma_final = self.config.sigma_fn(t_final[0]).item()
 
-            if sigma_final >= sigma_min:
-                if debug:
-                    print(f"\n[LanPaint] === Final Langevin correction, t={t_final[0]:.4f}, sigma={sigma_final:.4f} ===")
-                x = self._langevin_correction(
-                    x, t_final, y_0, unknown_mask, lambda_,
-                    K, h, Gamma, use_fld, sigma_min=sigma_min, max_score=max_score,
-                    y_cond=y, guidance=guidance, debug=debug
-                )
-            else:
-                if debug:
-                    print(f"\n[LanPaint] === Skipping final Langevin (sigma={sigma_final:.4f} < sigma_min={sigma_min:.4f}) ===")
+        #     if sigma_final >= sigma_min:
+        #         if debug:
+        #             print(f"\n[LanPaint] === Final Langevin correction, t={t_final[0]:.4f}, sigma={sigma_final:.4f} ===")
+        #         x = self._langevin_correction(
+        #             x, t_final, y_0, unknown_mask, lambda_,
+        #             K, h, Gamma, use_fld, sigma_min=sigma_min, max_score=max_score,
+        #             y_cond=y, guidance=guidance, debug=debug
+        #         )
+        #     else:
+        #         if debug:
+        #             print(f"\n[LanPaint] === Skipping final Langevin (sigma={sigma_final:.4f} < sigma_min={sigma_min:.4f}) ===")
 
         # Denormalize output
         x = self.initial_norm.unnorm(x)
@@ -1748,11 +1668,10 @@ class SIModule(lightning.LightningModule):
         # LanPaint parameters
         lambda_: float = 6.0,
         K: int = 5,
-        h: float = 0.3,
-        Gamma: float = 15.0,
-        use_fld: bool = True,
+        # MCMC parameters
+        mcmc_method: str = "tamed_ula",
+        mcmc_args: dict | None = None,
         # Stability parameters
-        sigma_min: float = 0.02,
         max_score: float | None = None,
         # Mask parameters
         mask_falloff: int = 0,
@@ -1763,7 +1682,7 @@ class SIModule(lightning.LightningModule):
         debug: bool = False
     ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
         """
-        Inpainting via LanPaint (Langevin dynamics).
+        Inpainting via LanPaint with MCMC sampling.
 
         Convenience wrapper around sample_posterior_lanpaint.
 
@@ -1778,13 +1697,22 @@ class SIModule(lightning.LightningModule):
             nsteps: Number of noise levels
 
             lambda_: Guidance strength (λ). Recommended: 4.0 - 10.0
-            K: Langevin steps per noise level. Recommended: 5 - 10
-            h: Langevin step size. Recommended: 0.1 - 0.5
-            Gamma: FLD friction coefficient. Recommended: 10.0 - 20.0
-            use_fld: If True, use Fast Langevin Dynamics; False for overdamped
+            K: MCMC steps per noise level. Recommended: 5 - 10
 
-            sigma_min: Minimum sigma for stability. Prevents λ/σ² explosion.
-                       Recommended: 0.01 - 0.05
+            mcmc_method: MCMC method to use. One of:
+                - "tamed_ula" (default): Tamed ULA, stable gradient bounding
+                - "overdamped", "ula": Overdamped Langevin
+                - "baoab": BAOAB splitting (stable underdamped)
+                - "hmc": Hamiltonian Monte Carlo
+                - "fld": Fast Langevin Dynamics
+                - "mala": Metropolis-Adjusted Langevin
+            mcmc_args: Method-specific arguments dict:
+                - tamed_ula: {"h": step_size (default 0.1)}
+                - overdamped: {"h": step_size (default 0.1)}
+                - baoab: {"h": step_size, "gamma": friction (default 1.0)}
+                - hmc: {"epsilon": leapfrog_step, "n_leapfrog": num_steps}
+                - fld: {"h": step_size, "gamma": friction}
+
             max_score: If set, clamp score magnitude to this value.
                        Prevents explosion. Try 10.0 - 100.0.
 
@@ -1830,10 +1758,8 @@ class SIModule(lightning.LightningModule):
             nsteps=nsteps,
             lambda_=lambda_,
             K=K,
-            h=h,
-            Gamma=Gamma,
-            use_fld=use_fld,
-            sigma_min=sigma_min,
+            mcmc_method=mcmc_method,
+            mcmc_args=mcmc_args,
             max_score=max_score,
             rho=rho,
             return_trajectory=return_trajectory,
