@@ -31,6 +31,11 @@ import itertools
 import torch
 
 from diffsci2.torchutils import periodic_getitem
+from diffsci2.nets.cached_norms import (
+    convert_to_cached_norms,
+    set_all_norms_mode,
+    clear_all_norm_caches,
+)
 
 
 # ============================================================================
@@ -554,6 +559,40 @@ def make_vae_stage_runner(
 
 
 # ============================================================================
+# CACHED NORMALIZATION SUPPORT
+# ============================================================================
+
+def prepare_decoder_for_cached_decode(
+    decoder,
+    inplace: bool = True
+):
+    """
+    Convert a decoder's normalization layers to cached versions.
+
+    This must be called once before using cached norm mode.
+
+    Args:
+        decoder: VAE decoder module
+        inplace: If True, modify decoder in place
+
+    Returns:
+        Decoder with cached norm layers
+    """
+    return convert_to_cached_norms(decoder, inplace=inplace)
+
+
+def _has_cached_norms(model: torch.nn.Module) -> bool:
+    """Check if model has any cached norm layers."""
+    from diffsci2.nets.cached_norms import (
+        CachedGroupNorm, CachedGroupRMSNorm, CachedGroupLNorm
+    )
+    for module in model.modules():
+        if isinstance(module, (CachedGroupNorm, CachedGroupRMSNorm, CachedGroupLNorm)):
+            return True
+    return False
+
+
+# ============================================================================
 # CONFIGURATION SETUP
 # ============================================================================
 
@@ -649,6 +688,7 @@ def chunk_decode_strategy_b(
     debug: bool = False,
     max_stage_out_chunk: Optional[Union[int, Tuple[int, ...], List[int]]] = 128,
     periodicity: Union[bool, Tuple[bool, ...], List[bool]] = False,
+    use_cached_norms: bool = False,
 ) -> torch.Tensor:
     """
     Dimension-agnostic chunked decode with Strategy B + optional periodic BCs.
@@ -665,15 +705,33 @@ def chunk_decode_strategy_b(
         debug: Enable debug prints
         max_stage_out_chunk: Cap per-stage output size (int or tuple per axis)
         periodicity: Enable periodic BCs (bool or tuple per axis)
+        use_cached_norms: If True, use first-tile norm caching to eliminate
+                         boundary artifacts. Requires decoder to have cached
+                         norm layers (call prepare_decoder_for_cached_decode first).
 
     Returns:
         Decoded output tensor [B, C_out, *spatial_out] on CPU
+
+    Note on use_cached_norms:
+        When enabled, for each stage:
+        1. First tile: compute and cache normalization statistics
+        2. Subsequent tiles: use cached statistics
+        3. Clear cache before next stage
+        This ensures consistent normalization across all tiles within a stage,
+        eliminating the "patch" artifacts at tile boundaries.
     """
     # Setup configuration
     cfg = setup_chunk_config(
         decoder, z_latent, chunk_latent, device,
         max_stage_out_chunk, periodicity, debug
     )
+
+    # Check if cached norms are available when requested
+    if use_cached_norms and not _has_cached_norms(decoder):
+        raise RuntimeError(
+            "use_cached_norms=True but decoder has no cached norm layers. "
+            "Call prepare_decoder_for_cached_decode(decoder) first."
+        )
 
     # Create stage runners
     stage_runners = [
@@ -704,6 +762,15 @@ def chunk_decode_strategy_b(
 
         dest_buf = stage_bufs[s]
         dest_created = dest_buf is not None
+
+        # For cached norms: clear cache and set to "cache" mode at start of stage
+        # First tile will compute and cache stats, then we switch to "use_cached"
+        if use_cached_norms:
+            clear_all_norm_caches(decoder)
+            set_all_norms_mode(decoder, "cache")
+            first_tile_of_stage = True
+            if cfg.debug:
+                print(f"  [CachedNorms] Stage {s}: ready to cache from first tile")
 
         # Iterate over all center tiles
         for center_ranges in iterate_nd_tiles(cfg.spans_per_axis):
@@ -739,6 +806,14 @@ def chunk_decode_strategy_b(
 
                 # Run stage
                 y_tile = stage_runners[s](x_in)
+
+                # For cached norms: after first tile, switch to use_cached mode
+                if use_cached_norms and first_tile_of_stage:
+                    set_all_norms_mode(decoder, "use_cached")
+                    first_tile_of_stage = False
+                    if cfg.debug:
+                        print(f"  [CachedNorms] Stage {s}: cached stats from first tile, "
+                              "using cached for remaining tiles")
 
                 # Allocate destination buffer if needed
                 if not dest_created:
@@ -779,8 +854,11 @@ def chunk_decode_strategy_b(
         prev_scale = dest_scale
         prev_buf = dest_buf
 
-    # Restore training state
+    # Restore training state and cleanup cached norms
     decoder.train(was_training)
+    if use_cached_norms:
+        set_all_norms_mode(decoder, "normal")
+        clear_all_norm_caches(decoder)
 
     return stage_bufs[-1].tensor
 
@@ -830,6 +908,118 @@ def chunk_decode_3d(
 
 
 # ============================================================================
+# HIGH-LEVEL API WITH CACHED NORMS
+# ============================================================================
+
+@torch.inference_mode()
+def chunk_decode_with_cached_norms(
+    decoder,
+    z_latent: torch.Tensor,
+    chunk_latent: Union[int, Tuple[int, ...], List[int]],
+    *,
+    device: Optional[Union[str, torch.device]] = None,
+    time: Optional[torch.Tensor] = None,
+    debug: bool = False,
+    max_stage_out_chunk: Optional[Union[int, Tuple[int, ...], List[int]]] = 128,
+    periodicity: Union[bool, Tuple[bool, ...], List[bool]] = False,
+    convert_norms: bool = True,
+) -> torch.Tensor:
+    """
+    Chunked decode with cached normalization statistics to eliminate tile boundary artifacts.
+
+    This is the recommended high-level API for chunked decoding. It:
+    1. Converts decoder's norm layers to cached versions (if convert_norms=True)
+    2. For each stage: first tile computes and caches norm stats, all other tiles reuse them
+    3. No memory blowup - stats gathered from first tile only, not full data
+
+    The Problem:
+        Standard chunk decode computes normalization statistics per-tile, which differ
+        between tiles, causing visible "patches" at boundaries.
+
+    The Solution:
+        For each decoder stage, compute normalization statistics from the FIRST tile only,
+        then use those cached statistics for ALL subsequent tiles in that stage.
+        Cache is cleared between stages.
+
+    Args:
+        decoder: VAE decoder module
+        z_latent: Latent tensor [B, C, H, W] (2D) or [B, C, H, W, D] (3D)
+        chunk_latent: Tile size in latent units
+        device: Compute device
+        time: Optional time embedding
+        debug: Enable debug prints
+        max_stage_out_chunk: Cap per-stage output size
+        periodicity: Enable periodic BCs
+        convert_norms: If True, convert norm layers to cached versions.
+                      Set False if already converted (e.g., for multiple decodes).
+
+    Returns:
+        Decoded output tensor [B, C_out, *spatial_out] on CPU
+
+    Example:
+        # Basic usage (handles everything automatically):
+        result = chunk_decode_with_cached_norms(decoder, z_latent, chunk_latent=32)
+
+        # For multiple decodes, convert once:
+        prepare_decoder_for_cached_decode(decoder)
+        for z in latents:
+            result = chunk_decode_with_cached_norms(
+                decoder, z, chunk_latent=32,
+                convert_norms=False  # Already converted
+            )
+    """
+    # Step 1: Convert norm layers to cached versions (one-time)
+    if convert_norms:
+        if debug:
+            print("Converting norm layers to cached versions...")
+        prepare_decoder_for_cached_decode(decoder, inplace=True)
+
+    # Step 2: Run chunked decode with per-stage first-tile caching
+    if debug:
+        print("Running chunked decode with first-tile norm caching...")
+
+    result = chunk_decode_strategy_b(
+        decoder, z_latent, chunk_latent,
+        device=device, time=time, debug=debug,
+        max_stage_out_chunk=max_stage_out_chunk,
+        periodicity=periodicity,
+        use_cached_norms=True,  # This enables per-stage first-tile caching
+    )
+
+    return result
+
+
+def chunk_decode_2d_cached(
+    decoder,
+    z_latent: torch.Tensor,
+    chunk_latent: Union[int, Tuple[int, int], List[int]],
+    **kwargs
+) -> torch.Tensor:
+    """
+    2D chunked decode with cached norms (convenience wrapper).
+
+    See chunk_decode_with_cached_norms for full documentation.
+    """
+    assert z_latent.dim() == 4, f"Expected 4D tensor [B, C, H, W], got {z_latent.dim()}D"
+    return chunk_decode_with_cached_norms(decoder, z_latent, chunk_latent, **kwargs)
+
+
+def chunk_decode_3d_cached(
+    decoder,
+    z_latent: torch.Tensor,
+    chunk_latent: Union[int, Tuple[int, int, int], List[int]],
+    **kwargs
+) -> torch.Tensor:
+    """
+    3D chunked decode with cached norms (convenience wrapper).
+
+    See chunk_decode_with_cached_norms for full documentation.
+    """
+    assert z_latent.dim() == 5, f"Expected 5D tensor [B, C, H, W, D], got {z_latent.dim()}D"
+    return chunk_decode_with_cached_norms(decoder, z_latent, chunk_latent, **kwargs)
+
+
+# ============================================================================
 # BACKWARD COMPATIBILITY ALIAS
 # ============================================================================
 
@@ -845,7 +1035,10 @@ if __name__ == "__main__":
     print("chunk_decode_2.py - Dimension-agnostic chunked decoder")
     print("Supports both 2D [B, C, H, W] and 3D [B, C, H, W, D] tensors")
     print()
-    print("Usage:")
+    print("=" * 70)
+    print("BASIC USAGE (without cached norms):")
+    print("=" * 70)
+    print()
     print("  from diffsci2.extra.chunk_decode_2 import chunk_decode_2d, chunk_decode_3d")
     print()
     print("  # For 2D:")
@@ -856,3 +1049,34 @@ if __name__ == "__main__":
     print()
     print("  # With periodicity:")
     print("  result = chunk_decode_3d(decoder, z, chunk, periodicity=(True, True, True))")
+    print()
+    print("=" * 70)
+    print("WITH CACHED NORMS (eliminates tile boundary artifacts):")
+    print("=" * 70)
+    print()
+    print("  How it works:")
+    print("    - For each decoder stage, the FIRST tile computes norm stats")
+    print("    - All subsequent tiles in that stage USE those cached stats")
+    print("    - Cache is cleared when moving to next stage")
+    print("    - NO memory blowup (stats from first tile only, not full data)")
+    print()
+    print("  from diffsci2.extra.chunk_decode_2 import (")
+    print("      chunk_decode_with_cached_norms,")
+    print("      chunk_decode_3d_cached,")
+    print("      prepare_decoder_for_cached_decode,")
+    print("  )")
+    print()
+    print("  # Simple usage (handles everything automatically):")
+    print("  result = chunk_decode_with_cached_norms(decoder, z_latent, chunk_latent=32)")
+    print()
+    print("  # Or use low-level API with use_cached_norms flag:")
+    print("  prepare_decoder_for_cached_decode(decoder)  # One-time conversion")
+    print("  result = chunk_decode_3d(decoder, z, chunk, use_cached_norms=True)")
+    print()
+    print("  # For multiple decodes (convert once, reuse):")
+    print("  prepare_decoder_for_cached_decode(decoder)")
+    print("  for z in latents:")
+    print("      result = chunk_decode_with_cached_norms(")
+    print("          decoder, z, chunk_latent=32,")
+    print("          convert_norms=False  # Already converted")
+    print("      )")
