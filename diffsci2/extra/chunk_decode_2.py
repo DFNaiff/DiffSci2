@@ -215,7 +215,7 @@ class ChunkConfig:
     spans_per_axis: List[List[Tuple[int, int]]]
     caps: Tuple[Optional[int], ...]     # Max output size per axis (or None)
     periodic: Tuple[bool, ...]          # Periodicity per axis
-    debug: bool
+    debug: int                          # 0=none, 1=per-stage, 2=per-tile
 
 
 @dataclass
@@ -593,6 +593,253 @@ def _has_cached_norms(model: torch.nn.Module) -> bool:
 
 
 # ============================================================================
+# MULTI-GPU PARALLEL PROCESSING SUPPORT
+# ============================================================================
+
+import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+
+def replicate_decoder_to_devices(
+    decoder: torch.nn.Module,
+    devices: List[torch.device],
+) -> List[torch.nn.Module]:
+    """
+    Create copies of decoder on multiple devices.
+
+    Args:
+        decoder: Source decoder (will be moved to devices[0])
+        devices: List of target devices
+
+    Returns:
+        List of decoder copies, one per device
+    """
+    decoders = []
+    for i, device in enumerate(devices):
+        if i == 0:
+            # Move original to first device
+            dec = decoder.to(device)
+        else:
+            # Deep copy for other devices
+            dec = copy.deepcopy(decoder).to(device)
+        dec.eval()
+        decoders.append(dec)
+    return decoders
+
+
+def sync_cached_norms_across_devices(
+    decoders: List[torch.nn.Module],
+    source_idx: int = 0,
+):
+    """
+    Sync cached normalization statistics from source decoder to all others.
+
+    After the first tile is processed on device 0, this copies the cached
+    stats to all other device copies so they use identical normalization.
+
+    Args:
+        decoders: List of decoder copies on different devices
+        source_idx: Index of source decoder with cached stats (default: 0)
+    """
+    from diffsci2.nets.cached_norms import (
+        CachedGroupNorm, CachedGroupRMSNorm, CachedGroupLNorm
+    )
+
+    source = decoders[source_idx]
+    targets = [d for i, d in enumerate(decoders) if i != source_idx]
+
+    # Get all cached norm layers from source
+    source_norms = {}
+    for name, module in source.named_modules():
+        if isinstance(module, (CachedGroupNorm, CachedGroupRMSNorm, CachedGroupLNorm)):
+            source_norms[name] = module
+
+    # Copy cached stats to each target
+    for target in targets:
+        target_device = next(target.parameters()).device
+        for name, module in target.named_modules():
+            if name in source_norms:
+                src_module = source_norms[name]
+                # Copy cached stats based on norm type
+                if isinstance(module, CachedGroupRMSNorm):
+                    if src_module._cached_rms is not None:
+                        module._cached_rms = src_module._cached_rms.to(target_device)
+                elif isinstance(module, (CachedGroupLNorm, CachedGroupNorm)):
+                    if hasattr(src_module, '_cached_mean') and src_module._cached_mean is not None:
+                        module._cached_mean = src_module._cached_mean.to(target_device)
+                    if hasattr(src_module, '_cached_std') and src_module._cached_std is not None:
+                        module._cached_std = src_module._cached_std.to(target_device)
+                    if hasattr(src_module, '_cached_var') and src_module._cached_var is not None:
+                        module._cached_var = src_module._cached_var.to(target_device)
+                # Copy mode
+                module._mode = src_module._mode
+
+
+class ParallelTileProcessor:
+    """
+    Processes tiles in parallel across multiple GPU devices.
+
+    Each device has its own decoder copy. Tiles are distributed round-robin
+    across devices and processed concurrently using a thread pool.
+    """
+
+    def __init__(
+        self,
+        decoders: List[torch.nn.Module],
+        devices: List[torch.device],
+        stage_runners: List[List[Callable]],  # [device_idx][stage_idx] -> runner
+        max_workers: Optional[int] = None,
+        aggressive_cleaning: bool = False,
+    ):
+        self.decoders = decoders
+        self.devices = devices
+        self.stage_runners = stage_runners
+        self.num_devices = len(devices)
+        self.max_workers = max_workers or self.num_devices
+        self.aggressive_cleaning = aggressive_cleaning
+
+        # Thread-local storage for CUDA streams
+        self._local = threading.local()
+
+        # Lock for thread-safe buffer writes
+        self._write_lock = threading.Lock()
+
+    def _get_stream(self, device_idx: int) -> torch.cuda.Stream:
+        """Get or create CUDA stream for this thread/device."""
+        if not hasattr(self._local, 'streams'):
+            self._local.streams = {}
+        if device_idx not in self._local.streams:
+            self._local.streams[device_idx] = torch.cuda.Stream(self.devices[device_idx])
+        return self._local.streams[device_idx]
+
+    def process_tile(
+        self,
+        device_idx: int,
+        stage_idx: int,
+        x_in: torch.Tensor,
+        crop: CropSpec,
+        dest_buf: CPUStageBuffer,
+    ) -> None:
+        """
+        Process a single tile on specified device.
+
+        Args:
+            device_idx: Which device to use
+            stage_idx: Current stage index
+            x_in: Input tile (on CPU)
+            crop: Crop specification for output
+            dest_buf: Destination CPU buffer
+        """
+        # NOTE: inference_mode is thread-local, so we must enter it in each thread.
+        # The main thread runs with @torch.inference_mode() decorator, which means
+        # the CPU buffers are inference tensors. Without entering inference_mode here,
+        # inplace updates (copy_) to those buffers would fail.
+        with torch.inference_mode():
+            device = self.devices[device_idx]
+            runner = self.stage_runners[device_idx][stage_idx]
+
+            # Use dedicated stream for this device
+            stream = self._get_stream(device_idx)
+
+            with torch.cuda.stream(stream):
+                # Transfer to GPU
+                x_gpu = x_in.to(device=device, non_blocking=True)
+
+                # Run stage
+                y_tile = runner(x_gpu)
+
+                # Crop valid center
+                slices = [slice(None), slice(None)]  # B, C
+                slices.extend(crop.tile_slices)
+                y_center = y_tile[tuple(slices)]
+
+                # Transfer back to CPU
+                y_cpu = y_center.cpu()
+
+                # Clean up GPU memory
+                del y_tile, y_center, x_gpu
+
+            # Synchronize stream
+            stream.synchronize()
+
+            # Write to buffer (thread-safe)
+            with self._write_lock:
+                dest_buf.write_block(crop.dest_ranges, y_cpu)
+
+            # Clean up tensor reference
+            del y_cpu
+
+            # Aggressive cleaning: empty cache after every tile (slower but minimal memory)
+            if self.aggressive_cleaning:
+                torch.cuda.empty_cache()
+
+    def process_tiles_parallel(
+        self,
+        stage_idx: int,
+        tile_jobs: List[Tuple[torch.Tensor, CropSpec]],  # [(x_in, crop), ...]
+        dest_buf: CPUStageBuffer,
+        debug: int = 0,
+    ) -> None:
+        """
+        Process multiple tiles in parallel across devices.
+
+        Args:
+            stage_idx: Current stage index
+            tile_jobs: List of (input_tensor, crop_spec) tuples
+            dest_buf: Destination CPU buffer
+            debug: Debug level (0=none, 1=per-stage, 2=per-tile)
+        """
+        if not tile_jobs:
+            return
+
+        if debug >= 2:
+            device_counts = [0] * self.num_devices
+            for i in range(len(tile_jobs)):
+                device_counts[i % self.num_devices] += 1
+            print(f"    Dispatching {len(tile_jobs)} tiles: {device_counts} tiles per device")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = []
+            for i, (x_in, crop) in enumerate(tile_jobs):
+                device_idx = i % self.num_devices
+                future = executor.submit(
+                    self.process_tile,
+                    device_idx, stage_idx, x_in, crop, dest_buf
+                )
+                futures.append(future)
+
+            # Wait for all to complete
+            for future in as_completed(futures):
+                # Raise any exceptions
+                future.result()
+
+        if debug >= 2:
+            print(f"    Completed {len(tile_jobs)} tiles in parallel")
+
+
+def create_stage_runners_for_devices(
+    decoders: List[torch.nn.Module],
+    num_stages: int,
+    time: Optional[torch.Tensor] = None,
+) -> List[List[Callable]]:
+    """
+    Create stage runner functions for each device.
+
+    Returns:
+        List of lists: stage_runners[device_idx][stage_idx] -> callable
+    """
+    all_runners = []
+    for decoder in decoders:
+        device_runners = [
+            make_vae_stage_runner(decoder, s, num_stages, time)
+            for s in range(num_stages)
+        ]
+        all_runners.append(device_runners)
+    return all_runners
+
+
+# ============================================================================
 # CONFIGURATION SETUP
 # ============================================================================
 
@@ -603,7 +850,7 @@ def setup_chunk_config(
     device: Optional[torch.device],
     max_stage_out_chunk: Optional[Union[int, Tuple, List]],
     periodicity: Union[bool, Tuple[bool, ...], List[bool]],
-    debug: bool
+    debug: int
 ) -> ChunkConfig:
     """Build configuration for chunked decoding."""
 
@@ -645,7 +892,7 @@ def setup_chunk_config(
         spans = make_center_spans_1d(L, ch, radii_latent[0])
         spans_per_axis.append(spans)
 
-    if debug:
+    if debug >= 1:
         print(f"Spatial shape: {spatial_shape} ({ndim}D)")
         print(f"radii_latent = {radii_latent}")
         print(f"delta_r_lat = {delta_r_lat}")
@@ -685,10 +932,11 @@ def chunk_decode_strategy_b(
     *,
     device: Optional[Union[str, torch.device]] = None,
     time: Optional[torch.Tensor] = None,
-    debug: bool = False,
+    debug: int = 0,
     max_stage_out_chunk: Optional[Union[int, Tuple[int, ...], List[int]]] = 128,
     periodicity: Union[bool, Tuple[bool, ...], List[bool]] = False,
     use_cached_norms: bool = False,
+    aggressive_cleaning: bool = False,
 ) -> torch.Tensor:
     """
     Dimension-agnostic chunked decode with Strategy B + optional periodic BCs.
@@ -702,12 +950,15 @@ def chunk_decode_strategy_b(
         chunk_latent: Tile size in latent units (int or tuple per axis)
         device: Compute device for stage tiles (default: decoder's device)
         time: Optional time embedding tensor
-        debug: Enable debug prints
+        debug: Debug verbosity level (0=none, 1=per-stage, 2=per-tile)
         max_stage_out_chunk: Cap per-stage output size (int or tuple per axis)
         periodicity: Enable periodic BCs (bool or tuple per axis)
         use_cached_norms: If True, use first-tile norm caching to eliminate
                          boundary artifacts. Requires decoder to have cached
                          norm layers (call prepare_decoder_for_cached_decode first).
+        aggressive_cleaning: If True, call torch.cuda.empty_cache() after every
+                            tile (slower but uses minimal GPU memory). Default False
+                            only cleans once per stage.
 
     Returns:
         Decoded output tensor [B, C_out, *spatial_out] on CPU
@@ -755,7 +1006,7 @@ def chunk_decode_strategy_b(
         src_scale = prev_scale
         up_factor = dest_scale // src_scale
 
-        if cfg.debug:
+        if cfg.debug >= 1:
             print(f"\n=== Stage {s} ===")
             print(f"  stage_local_lat={stage_local_lat}, src_scale={src_scale}, "
                   f"dest_scale={dest_scale}, up_factor={up_factor}")
@@ -769,22 +1020,29 @@ def chunk_decode_strategy_b(
             clear_all_norm_caches(decoder)
             set_all_norms_mode(decoder, "cache")
             first_tile_of_stage = True
-            if cfg.debug:
+            if cfg.debug >= 1:
                 print(f"  [CachedNorms] Stage {s}: ready to cache from first tile")
 
         # Iterate over all center tiles
+        tile_count = 0
         for center_ranges in iterate_nd_tiles(cfg.spans_per_axis):
             tile = TileSpec(ranges=center_ranges)
 
             # Split into sub-tiles if needed
             sub_tiles = generate_sub_tiles(tile, dest_scale, cfg.caps)
 
-            for sub_tile in sub_tiles:
+            for sub_idx, sub_tile in enumerate(sub_tiles):
                 # Compute read window
                 read_win = compute_read_window(
                     sub_tile, stage_local_lat, src_scale,
                     cfg.spatial_shape, cfg.periodic
                 )
+
+                if cfg.debug >= 2:
+                    print(f"  [Tile {tile_count}, sub {sub_idx}] "
+                          f"center={sub_tile.ranges}, "
+                          f"read_lat={read_win.lat_ranges}, "
+                          f"read_src={read_win.src_ranges}")
 
                 # Fetch input from source
                 if s == 0:
@@ -811,7 +1069,7 @@ def chunk_decode_strategy_b(
                 if use_cached_norms and first_tile_of_stage:
                     set_all_norms_mode(decoder, "use_cached")
                     first_tile_of_stage = False
-                    if cfg.debug:
+                    if cfg.debug >= 1:
                         print(f"  [CachedNorms] Stage {s}: cached stats from first tile, "
                               "using cached for remaining tiles")
 
@@ -827,7 +1085,7 @@ def chunk_decode_strategy_b(
                     )
                     dest_buf = stage_bufs[s]
                     dest_created = True
-                    if cfg.debug:
+                    if cfg.debug >= 1:
                         print(f"  Allocated dest buffer: {(B_, C_out, *out_spatial)}")
 
                 # Compute crop coordinates
@@ -835,6 +1093,11 @@ def chunk_decode_strategy_b(
                     sub_tile, read_win, src_scale, dest_scale, up_factor,
                     cfg.spatial_shape, cfg.periodic
                 )
+
+                if cfg.debug >= 2:
+                    print(f"    -> y_tile shape: {tuple(y_tile.shape)}, "
+                          f"crop_slices: {crop.tile_slices}, "
+                          f"dest_ranges: {crop.dest_ranges}")
 
                 # Crop valid center
                 slices = [slice(None), slice(None)]  # B, C
@@ -844,11 +1107,25 @@ def chunk_decode_strategy_b(
                 # Write to destination buffer
                 dest_buf.write_block(crop.dest_ranges, y_center)
 
-                # Free GPU memory
+                if cfg.debug >= 2:
+                    print(f"    -> wrote y_center shape: {tuple(y_center.shape)}")
+
+                # Free GPU tensor references (actual memory freed lazily by CUDA)
                 del y_tile, y_center, x_in
-                if torch.cuda.is_available():
+
+                # Aggressive cleaning: empty cache after every tile (slower but minimal memory)
+                if aggressive_cleaning and torch.cuda.is_available():
                     torch.cuda.synchronize(cfg.device)
                     torch.cuda.empty_cache()
+
+            tile_count += 1
+
+        if cfg.debug >= 1:
+            print(f"  Stage {s} complete: processed {tile_count} tiles")
+
+        # Clean up GPU memory once per stage (unless already doing aggressive cleaning)
+        if not aggressive_cleaning and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Update for next stage
         prev_scale = dest_scale
@@ -908,6 +1185,325 @@ def chunk_decode_3d(
 
 
 # ============================================================================
+# MULTI-GPU PARALLEL CHUNK DECODE
+# ============================================================================
+
+@torch.inference_mode()
+def chunk_decode_parallel(
+    decoder,
+    z_latent: torch.Tensor,
+    chunk_latent: Union[int, Tuple[int, ...], List[int]],
+    devices: List[Union[str, torch.device]],
+    *,
+    time: Optional[torch.Tensor] = None,
+    debug: int = 0,
+    max_stage_out_chunk: Optional[Union[int, Tuple[int, ...], List[int]]] = 128,
+    periodicity: Union[bool, Tuple[bool, ...], List[bool]] = False,
+    use_cached_norms: bool = False,
+    aggressive_cleaning: bool = False,
+) -> torch.Tensor:
+    """
+    Multi-GPU parallel chunked decode.
+
+    Distributes tiles across multiple CUDA devices for parallel processing.
+    Each device gets a copy of the decoder and processes tiles concurrently.
+
+    Args:
+        decoder: VAE decoder module
+        z_latent: Latent tensor [B, C, H, W] (2D) or [B, C, H, W, D] (3D)
+        chunk_latent: Tile size in latent units
+        devices: List of CUDA devices (e.g., ["cuda:0", "cuda:1", "cuda:2", "cuda:3"])
+        time: Optional time embedding tensor
+        debug: Debug verbosity level (0=none, 1=per-stage, 2=per-tile)
+        max_stage_out_chunk: Cap per-stage output size
+        periodicity: Enable periodic BCs
+        use_cached_norms: If True, use first-tile norm caching (requires cached norm layers)
+        aggressive_cleaning: If True, call empty_cache() after every tile (slower but minimal memory)
+
+    Returns:
+        Decoded output tensor [B, C_out, *spatial_out] on CPU
+
+    Example:
+        # Use 4 GPUs in parallel
+        devices = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+        result = chunk_decode_parallel(
+            decoder, z_latent, chunk_latent=32,
+            devices=devices, use_cached_norms=True
+        )
+
+    Note:
+        - First tile of each stage is always processed on devices[0]
+        - If use_cached_norms=True, cached stats are synced to all devices after first tile
+        - Speedup scales roughly linearly with number of devices (for many tiles)
+    """
+    # Normalize devices
+    devices = [torch.device(d) for d in devices]
+    num_devices = len(devices)
+
+    if num_devices < 1:
+        raise ValueError("At least one device required")
+
+    if num_devices == 1:
+        # Fall back to single-device version
+        return chunk_decode_strategy_b(
+            decoder, z_latent, chunk_latent,
+            device=devices[0], time=time, debug=debug,
+            max_stage_out_chunk=max_stage_out_chunk,
+            periodicity=periodicity, use_cached_norms=use_cached_norms
+        )
+
+    if debug >= 1:
+        print(f"Parallel decode on {num_devices} devices: {devices}")
+
+    # Check cached norms
+    if use_cached_norms and not _has_cached_norms(decoder):
+        raise RuntimeError(
+            "use_cached_norms=True but decoder has no cached norm layers. "
+            "Call prepare_decoder_for_cached_decode(decoder) first."
+        )
+
+    # Setup configuration (use first device for config)
+    cfg = setup_chunk_config(
+        decoder, z_latent, chunk_latent, devices[0],
+        max_stage_out_chunk, periodicity, debug
+    )
+
+    # Replicate decoder to all devices
+    if debug >= 1:
+        print("Replicating decoder to all devices...")
+    decoders = replicate_decoder_to_devices(decoder, devices)
+
+    # Create stage runners for each device
+    stage_runners = create_stage_runners_for_devices(decoders, cfg.num_stages, time)
+
+    # Create parallel processor
+    parallel_processor = ParallelTileProcessor(
+        decoders, devices, stage_runners,
+        max_workers=num_devices,
+        aggressive_cleaning=aggressive_cleaning,
+    )
+
+    # CPU buffers for each stage
+    stage_bufs: List[Optional[CPUStageBuffer]] = [None] * cfg.num_stages
+    prev_scale = 1
+    prev_buf: Optional[CPUStageBuffer] = None
+
+    # Process each stage
+    for s in range(cfg.num_stages):
+        stage_local_lat = cfg.delta_r_lat[s]
+        dest_scale = cfg.scales_after[s]
+        src_scale = prev_scale
+        up_factor = dest_scale // src_scale
+
+        if debug >= 1:
+            print(f"\n=== Stage {s} ===")
+            print(f"  stage_local_lat={stage_local_lat}, src_scale={src_scale}, "
+                  f"dest_scale={dest_scale}, up_factor={up_factor}")
+
+        dest_buf = stage_bufs[s]
+        dest_created = dest_buf is not None
+
+        # For cached norms: set all decoders to cache mode at start of stage
+        if use_cached_norms:
+            for dec in decoders:
+                clear_all_norm_caches(dec)
+                set_all_norms_mode(dec, "cache")
+            first_tile_of_stage = True
+            if debug >= 1:
+                print(f"  [CachedNorms] Stage {s}: ready to cache from first tile")
+
+        # Collect all tiles for this stage
+        all_tiles = list(iterate_nd_tiles(cfg.spans_per_axis))
+
+        # Process tiles
+        tile_idx = 0
+        while tile_idx < len(all_tiles):
+            center_ranges = all_tiles[tile_idx]
+            tile = TileSpec(ranges=center_ranges)
+            sub_tiles = generate_sub_tiles(tile, dest_scale, cfg.caps)
+
+            # Process first tile on device 0 (for cached norms)
+            if use_cached_norms and first_tile_of_stage:
+                # Process first sub-tile on device 0 only
+                first_sub = sub_tiles[0]
+                read_win = compute_read_window(
+                    first_sub, stage_local_lat, src_scale,
+                    cfg.spatial_shape, cfg.periodic
+                )
+
+                # Fetch input
+                if s == 0:
+                    B, C = z_latent.shape[:2]
+                    flat = z_latent.reshape(B * C, *cfg.spatial_shape)
+                    indices = [slice(None)]
+                    for (rs, re) in read_win.lat_ranges:
+                        indices.append(slice(rs, re, None))
+                    x_in_flat = periodic_getitem(flat, *indices)
+                    new_spatial = x_in_flat.shape[1:]
+                    x_in = x_in_flat.reshape(B, C, *new_spatial)
+                    x_in = x_in.to(device=devices[0], dtype=z_latent.dtype).contiguous()
+                else:
+                    x_in = prev_buf.read_block_periodic(
+                        read_win.src_ranges, devices[0], cfg.dtype
+                    )
+
+                # Run on device 0 (caches stats)
+                y_tile = stage_runners[0][s](x_in)
+
+                # Allocate buffer if needed
+                if not dest_created:
+                    B_ = cfg.batch_size
+                    C_out = int(y_tile.shape[1])
+                    out_spatial = tuple(L * dest_scale for L in cfg.spatial_shape)
+                    stage_bufs[s] = CPUStageBuffer(
+                        shape=(B_, C_out, *out_spatial),
+                        dtype=y_tile.dtype,
+                        ndim=cfg.ndim
+                    )
+                    dest_buf = stage_bufs[s]
+                    dest_created = True
+                    if debug >= 1:
+                        print(f"  Allocated dest buffer: {(B_, C_out, *out_spatial)}")
+
+                # Crop and write
+                crop = compute_crop_spec(
+                    first_sub, read_win, src_scale, dest_scale, up_factor,
+                    cfg.spatial_shape, cfg.periodic
+                )
+                slices = [slice(None), slice(None)]
+                slices.extend(crop.tile_slices)
+                y_center = y_tile[tuple(slices)]
+                dest_buf.write_block(crop.dest_ranges, y_center.cpu())
+
+                del y_tile, y_center, x_in
+                torch.cuda.synchronize(devices[0])
+                torch.cuda.empty_cache()
+
+                # Switch all decoders to use_cached mode and sync stats
+                for dec in decoders:
+                    set_all_norms_mode(dec, "use_cached")
+                sync_cached_norms_across_devices(decoders, source_idx=0)
+
+                if debug >= 1:
+                    print(f"  [CachedNorms] Stage {s}: cached stats synced to all {num_devices} devices")
+
+                first_tile_of_stage = False
+
+                # Remove processed sub-tile
+                sub_tiles = sub_tiles[1:]
+                if not sub_tiles:
+                    tile_idx += 1
+                    continue
+
+            # Batch remaining sub-tiles for parallel processing
+            tile_jobs = []
+            for sub_idx, sub_tile in enumerate(sub_tiles):
+                read_win = compute_read_window(
+                    sub_tile, stage_local_lat, src_scale,
+                    cfg.spatial_shape, cfg.periodic
+                )
+
+                if debug >= 2:
+                    print(f"  [Tile {tile_idx}, sub {sub_idx}] "
+                          f"center={sub_tile.ranges}, "
+                          f"read_lat={read_win.lat_ranges}, "
+                          f"read_src={read_win.src_ranges}")
+
+                # Fetch input (to CPU)
+                if s == 0:
+                    B, C = z_latent.shape[:2]
+                    flat = z_latent.reshape(B * C, *cfg.spatial_shape)
+                    indices = [slice(None)]
+                    for (rs, re) in read_win.lat_ranges:
+                        indices.append(slice(rs, re, None))
+                    x_in_flat = periodic_getitem(flat, *indices)
+                    new_spatial = x_in_flat.shape[1:]
+                    x_in = x_in_flat.reshape(B, C, *new_spatial)
+                    x_in = x_in.to(dtype=z_latent.dtype).contiguous()  # CPU
+                else:
+                    x_in = prev_buf.read_block_periodic(
+                        read_win.src_ranges, torch.device("cpu"), cfg.dtype
+                    )
+
+                # Allocate buffer if needed (use a dummy run to get output shape)
+                if not dest_created:
+                    # Run one tile to get output channels
+                    x_probe = x_in.to(device=devices[0])
+                    y_probe = stage_runners[0][s](x_probe)
+                    B_ = cfg.batch_size
+                    C_out = int(y_probe.shape[1])
+                    out_spatial = tuple(L * dest_scale for L in cfg.spatial_shape)
+                    stage_bufs[s] = CPUStageBuffer(
+                        shape=(B_, C_out, *out_spatial),
+                        dtype=y_probe.dtype,
+                        ndim=cfg.ndim
+                    )
+                    dest_buf = stage_bufs[s]
+                    dest_created = True
+                    del x_probe, y_probe
+                    torch.cuda.empty_cache()
+                    if debug >= 1:
+                        print(f"  Allocated dest buffer: {(B_, C_out, *out_spatial)}")
+
+                crop = compute_crop_spec(
+                    sub_tile, read_win, src_scale, dest_scale, up_factor,
+                    cfg.spatial_shape, cfg.periodic
+                )
+                tile_jobs.append((x_in, crop))
+
+            # Process batch in parallel
+            if tile_jobs:
+                parallel_processor.process_tiles_parallel(
+                    s, tile_jobs, dest_buf, debug=debug
+                )
+
+            tile_idx += 1
+
+        if debug >= 1:
+            print(f"  Stage {s} complete: processed {tile_idx} tiles")
+
+        # Clean up GPU memory once per stage (unless already doing aggressive cleaning)
+        if not aggressive_cleaning and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Update for next stage
+        prev_scale = dest_scale
+        prev_buf = dest_buf
+
+    # Cleanup: reset norms on all decoders
+    if use_cached_norms:
+        for dec in decoders:
+            set_all_norms_mode(dec, "normal")
+            clear_all_norm_caches(dec)
+
+    return stage_bufs[-1].tensor
+
+
+def chunk_decode_2d_parallel(
+    decoder,
+    z_latent: torch.Tensor,
+    chunk_latent: Union[int, Tuple[int, int], List[int]],
+    devices: List[Union[str, torch.device]],
+    **kwargs
+) -> torch.Tensor:
+    """2D multi-GPU parallel chunked decode. See chunk_decode_parallel for details."""
+    assert z_latent.dim() == 4, f"Expected 4D tensor [B, C, H, W], got {z_latent.dim()}D"
+    return chunk_decode_parallel(decoder, z_latent, chunk_latent, devices, **kwargs)
+
+
+def chunk_decode_3d_parallel(
+    decoder,
+    z_latent: torch.Tensor,
+    chunk_latent: Union[int, Tuple[int, int, int], List[int]],
+    devices: List[Union[str, torch.device]],
+    **kwargs
+) -> torch.Tensor:
+    """3D multi-GPU parallel chunked decode. See chunk_decode_parallel for details."""
+    assert z_latent.dim() == 5, f"Expected 5D tensor [B, C, H, W, D], got {z_latent.dim()}D"
+    return chunk_decode_parallel(decoder, z_latent, chunk_latent, devices, **kwargs)
+
+
+# ============================================================================
 # HIGH-LEVEL API WITH CACHED NORMS
 # ============================================================================
 
@@ -919,7 +1515,7 @@ def chunk_decode_with_cached_norms(
     *,
     device: Optional[Union[str, torch.device]] = None,
     time: Optional[torch.Tensor] = None,
-    debug: bool = False,
+    debug: int = 0,
     max_stage_out_chunk: Optional[Union[int, Tuple[int, ...], List[int]]] = 128,
     periodicity: Union[bool, Tuple[bool, ...], List[bool]] = False,
     convert_norms: bool = True,
@@ -970,12 +1566,12 @@ def chunk_decode_with_cached_norms(
     """
     # Step 1: Convert norm layers to cached versions (one-time)
     if convert_norms:
-        if debug:
+        if debug >= 1:
             print("Converting norm layers to cached versions...")
         prepare_decoder_for_cached_decode(decoder, inplace=True)
 
     # Step 2: Run chunked decode with per-stage first-tile caching
-    if debug:
+    if debug >= 1:
         print("Running chunked decode with first-tile norm caching...")
 
     result = chunk_decode_strategy_b(
@@ -1080,3 +1676,36 @@ if __name__ == "__main__":
     print("          decoder, z, chunk_latent=32,")
     print("          convert_norms=False  # Already converted")
     print("      )")
+    print()
+    print("=" * 70)
+    print("MULTI-GPU PARALLEL (process tiles on multiple GPUs):")
+    print("=" * 70)
+    print()
+    print("  How it works:")
+    print("    - Decoder is replicated to each GPU")
+    print("    - Tiles are distributed round-robin across GPUs")
+    print("    - All GPUs process tiles concurrently (ThreadPoolExecutor)")
+    print("    - Results collected to CPU buffer")
+    print("    - If using cached norms: first tile caches stats on GPU 0,")
+    print("      then stats are synced to all other GPUs")
+    print()
+    print("  from diffsci2.extra.chunk_decode_2 import (")
+    print("      chunk_decode_parallel,")
+    print("      chunk_decode_3d_parallel,")
+    print("      prepare_decoder_for_cached_decode,")
+    print("  )")
+    print()
+    print("  # Use 4 GPUs in parallel:")
+    print("  devices = ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3']")
+    print("  result = chunk_decode_parallel(")
+    print("      decoder, z_latent, chunk_latent=32,")
+    print("      devices=devices")
+    print("  )")
+    print()
+    print("  # With cached norms on multiple GPUs:")
+    print("  prepare_decoder_for_cached_decode(decoder)")
+    print("  result = chunk_decode_3d_parallel(")
+    print("      decoder, z_latent, chunk_latent=32,")
+    print("      devices=['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3'],")
+    print("      use_cached_norms=True")
+    print("  )")
