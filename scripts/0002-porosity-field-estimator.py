@@ -78,6 +78,10 @@ def parse_args():
         '--voxel-size', type=float, default=1.0,
         help='Physical voxel size for distance scaling'
     )
+    parser.add_argument(
+        '--use-full-porosity-field', action='store_true',
+        help='Use full "same" convolution for porosity field (default: use cropped "valid")'
+    )
     return parser.parse_args()
 
 
@@ -88,7 +92,7 @@ def create_averaging_kernel(kernel_size):
 
 def calculate_porosity_field(data, kernel_size):
     """
-    Calculate the local porosity field using FFT convolution.
+    Calculate the local porosity field using FFT convolution (valid mode, cropped).
 
     Parameters
     ----------
@@ -109,6 +113,48 @@ def calculate_porosity_field(data, kernel_size):
         kernel,
         mode='valid'
     )
+    return porosity_field
+
+
+def calculate_porosity_field_full(data, kernel_size):
+    """
+    Calculate the local porosity field using FFT convolution (same mode, full size).
+
+    Uses proper normalization that accounts for boundary effects: at each position,
+    divides by the number of actual (non-padded) voxels that contributed.
+
+    Parameters
+    ----------
+    data : ndarray
+        Binary volume (0=pore, 1=solid or vice versa)
+    kernel_size : int
+        Size of the averaging kernel
+
+    Returns
+    -------
+    porosity_field : ndarray
+        Local mean porosity field (same shape as input)
+    """
+    # Use a sum kernel (not normalized)
+    kernel = np.ones((kernel_size, kernel_size, kernel_size))
+
+    # 1 - data converts from solid=1 to pore=1 representation
+    pore_data = 1 - data.astype(np.float32)
+
+    # Convolve to get sum of pore values
+    pore_sum = scipy.signal.fftconvolve(pore_data, kernel, mode='same')
+
+    # Convolve ones to get the count of contributing voxels at each position
+    # This accounts for boundary effects
+    normalization = scipy.signal.fftconvolve(
+        np.ones_like(pore_data),
+        kernel,
+        mode='same'
+    )
+
+    # Divide to get mean porosity
+    porosity_field = pore_sum / normalization
+
     return porosity_field
 
 
@@ -220,18 +266,42 @@ def main():
 
     # Calculate porosity field
     print(f"Calculating porosity field with kernel size {args.kernel_size}...")
-    porosity_field = calculate_porosity_field(data, args.kernel_size)
+    if args.use_full_porosity_field:
+        print("  Using full 'same' convolution with boundary normalization...")
+        porosity_field_full = calculate_porosity_field_full(data, args.kernel_size)
+        print(f"  Full porosity field shape: {porosity_field_full.shape}")
+        print(f"  Full porosity range: [{porosity_field_full.min():.4f}, {porosity_field_full.max():.4f}]")
+        print(f"  Full mean porosity: {porosity_field_full.mean():.4f}")
+
+        # Crop to valid region for GP calculation
+        half_k = args.kernel_size // 2
+        porosity_field = porosity_field_full[
+            half_k:-half_k,
+            half_k:-half_k,
+            half_k:-half_k
+        ]
+        print(f"  Cropped porosity field shape (for GP): {porosity_field.shape}")
+    else:
+        porosity_field_full = None
+        porosity_field = calculate_porosity_field(data, args.kernel_size)
+
     print(f"Porosity field shape: {porosity_field.shape}")
     print(f"Porosity range: [{porosity_field.min():.4f}, {porosity_field.max():.4f}]")
     print(f"Mean porosity: {porosity_field.mean():.4f}")
 
     # Optionally save porosity field
     if args.save_field:
+        if args.use_full_porosity_field:
+            # Save the full field
+            field_path = os.path.join(args.output_dir, f'{output_prefix}_porosity_field_full.npy')
+            print(f"Saving full porosity field to {field_path}")
+            np.save(field_path, porosity_field_full)
+        # Always save the cropped/valid field
         field_path = os.path.join(args.output_dir, f'{output_prefix}_porosity_field.npy')
         print(f"Saving porosity field to {field_path}")
         np.save(field_path, porosity_field)
 
-    # Calculate logit correlation
+    # Calculate logit correlation (always on cropped/valid field)
     print(f"Calculating logit-transformed TPC on {args.device}...")
     corr_data = calculate_logit_correlation(
         porosity_field,
@@ -276,7 +346,8 @@ def main():
         volume_shape=args.volume_shape,
         porosity_field_shape=porosity_field.shape,
         voxel_size=args.voxel_size,
-        source_file=os.path.basename(args.data_path)
+        source_file=os.path.basename(args.data_path),
+        use_full_porosity_field=args.use_full_porosity_field
     )
 
     print("Done!")

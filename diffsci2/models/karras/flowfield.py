@@ -230,6 +230,29 @@ class Preconditioner(object):
                 v = self.precondition_fn(model, x, t, y=y)
         return v
 
+    def get_denoiser_output(self, model, x, t=None, y=None):
+        """
+        Get the denoiser output D(x, sigma) directly for denoiser loss computation.
+
+        This method returns the denoised estimate x̂_0 = D(x_noised, sigma),
+        used for computing the Karras EDM-style denoiser loss:
+            loss = lambda(sigma) * ||D(x_noised, sigma) - x_clean||^2
+
+        Only supported for 'edm' precondition_fn currently.
+        """
+        if isinstance(self.precondition_fn, str):
+            if self.precondition_fn == 'edm':
+                return self.edm_denoiser(model, x, t, y)
+            else:
+                raise ValueError(
+                    f"get_denoiser_output only supported for 'edm' precondition_fn, "
+                    f"got '{self.precondition_fn}'"
+                )
+        else:
+            raise ValueError(
+                "get_denoiser_output only supported for string precondition_fn='edm'"
+            )
+
     def identity(self, model, x, t=None, y=None):
         if self.is_autonomous:
             return model(x, y=y)
@@ -392,6 +415,10 @@ class SIModuleConfig(torch.nn.Module):
     - Normalized mode (default): t in [0, 1], scheduler maps to noise levels
     - Sigma-space mode: t IS sigma directly, t in [sigma_min, sigma_max]
 
+    Supports two loss formulations:
+    - 'flow_field': Train on flow field matching ||v(x_t, t) - v_target||
+    - 'denoiser': Train on denoiser matching ||D(x_t, sigma) - x_clean|| (Karras EDM style)
+
     Use the factory methods for common configurations:
     - SIModuleConfig.from_edm_sigma_space() for EDM paper-style behavior
     """
@@ -407,6 +434,7 @@ class SIModuleConfig(torch.nn.Module):
                  loss_weighting: Literal['edm', 'uniform', 'edm_sigma'] | dict[str, Any] = 'uniform',
                  loss_weighting_kwargs: dict[str, Any] = {},
                  loss_metric: Literal['mse', 'huber'] = 'huber',
+                 loss_formulation: Literal['flow_field', 'denoiser'] = 'flow_field',
                  autoencoder_is_conditional: bool = False,
                  encode_condition: bool = False):
         super().__init__()
@@ -421,6 +449,7 @@ class SIModuleConfig(torch.nn.Module):
         self._loss_weighting_config = loss_weighting
         self._loss_weighting_kwargs = loss_weighting_kwargs
         self.loss_metric = loss_metric
+        self.loss_formulation = loss_formulation
         self.precondition_fn = precondition_fn
         self.preconditioner_kwargs = preconditioner_kwargs
         self.autoencoder_is_conditional = autoencoder_is_conditional
@@ -441,6 +470,7 @@ class SIModuleConfig(torch.nn.Module):
         num_channels: int | None = None,
         initial_norm: bool | float = False,
         loss_metric: Literal['mse', 'huber'] = 'huber',
+        loss_formulation: Literal['flow_field', 'denoiser'] = 'flow_field',
         autoencoder_is_conditional: bool = False,
         encode_condition: bool = False
     ):
@@ -462,6 +492,10 @@ class SIModuleConfig(torch.nn.Module):
             num_channels: Number of channels for batch norm
             initial_norm: Whether to use initial normalization
             loss_metric: Loss function ('mse' or 'huber')
+            loss_formulation: Loss formulation to use:
+                - 'flow_field': Train on flow field matching (default)
+                - 'denoiser': Train on denoiser matching ||D(x_t, sigma) - x_clean||
+                  This replicates the original Karras EDM paper loss function.
             autoencoder_is_conditional: Whether autoencoder uses conditioning
             encode_condition: Whether to encode the condition
 
@@ -480,6 +514,7 @@ class SIModuleConfig(torch.nn.Module):
             loss_weighting='edm_sigma',
             loss_weighting_kwargs={'sigma_data': sigma_data, 'pmean': pmean, 'pstd': pstd},
             loss_metric=loss_metric,
+            loss_formulation=loss_formulation,
             autoencoder_is_conditional=autoencoder_is_conditional,
             encode_condition=encode_condition
         )
@@ -597,12 +632,23 @@ class SIModule(lightning.LightningModule):
         t_broadcasted = broadcast_from_below(t, x)
         alpha, sigma = self.config.alpha_fn(t_broadcasted), self.config.sigma_fn(t_broadcasted)
         x_noised = alpha * x + sigma * noise
-        flow_field = self.get_flow_field(x_noised, t, y=y, guidance=1.0)
 
-        alpha_dot, sigma_dot = self.config.alpha_fn_dot(t_broadcasted), self.config.sigma_fn_dot(t_broadcasted)
-        target = (alpha_dot * x + sigma_dot * noise)
+        if self.config.loss_formulation == 'denoiser':
+            # Denoiser loss (Karras EDM style):
+            # loss = lambda(sigma) * ||D(x_noised, sigma) - x_clean||^2
+            # This matches the original karrasmodule.py behavior
+            denoiser_output = self.get_denoiser_output(x_noised, t, y=y)
+            target = x  # Clean data is the target
+            loss = self.config.loss_metric_module(denoiser_output, target)
+        else:
+            # Flow field loss (default):
+            # loss = w(t) * ||v(x_noised, t) - (alpha_dot * x + sigma_dot * noise)||^2
+            flow_field = self.get_flow_field(x_noised, t, y=y, guidance=1.0)
+            alpha_dot = self.config.alpha_fn_dot(t_broadcasted)
+            sigma_dot = self.config.sigma_fn_dot(t_broadcasted)
+            target = (alpha_dot * x + sigma_dot * noise)
+            loss = self.config.loss_metric_module(flow_field, target)
 
-        loss = self.config.loss_metric_module(flow_field, target)
         loss_weighting = self.config.loss_weighting.weighting_function(t_broadcasted)
         loss = loss * loss_weighting
 
@@ -697,6 +743,43 @@ class SIModule(lightning.LightningModule):
             sigma_dot = self.config.sigma_fn_dot(t)
             flow_field = flow_field / sigma_dot
         return flow_field
+
+    def get_denoiser_output(
+        self,
+        x_noised: Float[Tensor, "batch *shape"],  # noqa: F821, typing
+        t: Float[Tensor, "batch"],  # noqa: F821, typing
+        y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821, typing
+        guidance: float = 1.0
+    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821, typing
+        """
+        Get the denoiser output D(x_noised, sigma) for denoiser loss computation.
+
+        This returns the preconditioned denoiser output, used for computing
+        the Karras EDM-style denoiser loss:
+            loss = lambda(sigma) * ||D(x_noised, sigma) - x_clean||^2
+
+        Args:
+            x_noised: Noisy input [batch, *shape]
+            t: Time/sigma values [batch]
+            y: Optional conditioning
+            guidance: Classifier-free guidance scale (default 1.0, no guidance)
+
+        Returns:
+            Denoised estimate D(x_noised, sigma) [batch, *shape]
+        """
+        if guidance == 1.0 or y is None:
+            denoiser = self.config.preconditioner.get_denoiser_output(
+                self.model, x_noised, t, y=y
+            )
+        else:
+            denoiser = self.config.preconditioner.get_denoiser_output(
+                self.model, x_noised, t, y=y
+            )
+            unconditioned_denoiser = self.config.preconditioner.get_denoiser_output(
+                self.model, x_noised, t, y=None
+            )
+            denoiser = guidance * denoiser + (1 - guidance) * unconditioned_denoiser
+        return denoiser
 
     def get_score_field(
         self,

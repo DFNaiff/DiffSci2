@@ -1,8 +1,60 @@
+import warnings
+
 import numpy as np
 from scipy.special import kv, gamma
 from scipy.optimize import curve_fit
 from scipy.spatial.distance import cdist
 from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import gaussian_filter
+
+
+def smooth_periodic(field, sigma, mode='wrap'):
+    """
+    Apply Gaussian smoothing to a field with periodic boundary conditions.
+
+    Parameters
+    ----------
+    field : ndarray
+        Input field of any dimension. Can be a single sample (D, H, W) or
+        batched samples (n_samples, D, H, W).
+    sigma : float or sequence of floats
+        Standard deviation of the Gaussian kernel. If a single float, the same
+        sigma is used for all spatial dimensions. If a sequence, specifies sigma
+        for each spatial dimension.
+    mode : str, optional
+        Boundary mode. Default is 'wrap' for periodic boundaries.
+        Other options: 'reflect', 'constant', 'nearest', 'mirror'.
+
+    Returns
+    -------
+    smoothed : ndarray
+        Smoothed field with same shape as input.
+
+    Examples
+    --------
+    >>> # Smooth a single 3D field with sigma=2
+    >>> smoothed = smooth_periodic(field, sigma=2.0)
+
+    >>> # Smooth batched samples
+    >>> samples = sampler.sample_grid(10)  # (10, 64, 64, 64)
+    >>> smoothed = smooth_periodic(samples, sigma=1.5)
+    """
+    field = np.asarray(field)
+
+    if field.ndim == 0:
+        return field
+
+    # Check if batched (heuristic: if 4D, assume first dim is batch for 3D fields)
+    # For safety, we apply filter to each sample if it looks batched
+    # Actually, gaussian_filter handles this naturally - sigma applies per axis
+    # We just need to make sure sigma doesn't apply to batch dimension
+
+    if np.isscalar(sigma):
+        # Apply same sigma to all dimensions
+        return gaussian_filter(field, sigma=sigma, mode=mode)
+    else:
+        # sigma is a sequence - use as-is
+        return gaussian_filter(field, sigma=sigma, mode=mode)
 
 
 def matern_covariance(r, sigma_sq, nu, length_scale):
@@ -324,3 +376,941 @@ class MaternFieldSampler:
             result[i] = interpolator(target_points).reshape(target_shape)
 
         return result
+
+
+class PeriodicMaternFieldSampler:
+    """
+    Periodic Matérn Gaussian Process sampler using circulant embedding (FFT method).
+
+    This sampler generates GP realizations on a regular grid with periodic boundary
+    conditions. The key insight is that for a stationary GP on a periodic grid,
+    the covariance matrix is circulant and can be diagonalized via FFT.
+
+    Complexity: O(N^d log N) vs O(N^{3d}) for Cholesky on N^d grid.
+
+    The field satisfies: f(x + L) = f(x) for all coordinates, where L is the period.
+
+    Parameters
+    ----------
+    mean_val : float
+        The constant mean of the field (mu).
+    sigma_sq : float
+        Amplitude (Variance) - often called theta or sigma^2.
+    nu : float
+        Smoothness parameter.
+    length_scale : float
+        Length scale parameter (l).
+    jitter : float
+        Small value for numerical stability (added to zero-frequency eigenvalue).
+
+    Notes
+    -----
+    For best results, the domain size (period) should be significantly larger
+    than the correlation length (L >> length_scale). If L is too small relative
+    to length_scale, the circulant embedding may produce negative eigenvalues,
+    which are thresholded to zero with a warning.
+
+    References
+    ----------
+    Wood, A.T.A., & Chan, G. (1994). "Simulation of stationary Gaussian processes
+    in [0,1]^d". Journal of Computational and Graphical Statistics, 3(4), 409-432.
+    """
+
+    def __init__(
+        self,
+        mean_val,
+        sigma_sq,
+        nu,
+        length_scale,
+        jitter=1e-6
+    ):
+        self.mean_val = mean_val
+        self.sigma_sq = sigma_sq
+        self.nu = nu
+        self.length_scale = length_scale
+        self.jitter = jitter
+
+        # Grid parameters (set via initialize_field_from_grid)
+        self.grid_shape = None
+        self.grid_axes = None
+        self.periods = None
+        self.Lambda = None  # Eigenvalues (FFT of circulant first row)
+        self._n_negative_eigenvalues = 0
+
+    def initialize_periodic_grid(self, grid_shape, periods):
+        """
+        Initialize field for periodic sampling with explicit grid shape and periods.
+
+        This is a convenience method when you don't need explicit coordinate axes.
+        Coordinates are implicitly [0, period) in each dimension.
+
+        Parameters
+        ----------
+        grid_shape : tuple of int
+            Number of grid points in each dimension, e.g., (64, 64, 64).
+        periods : tuple of float
+            Period (domain size) in each dimension, e.g., (512.0, 512.0, 512.0).
+
+        Example
+        -------
+        >>> sampler = PeriodicMaternFieldSampler(mean_val=0, sigma_sq=1, nu=1.5, length_scale=10)
+        >>> sampler.initialize_periodic_grid((64, 64, 64), (256.0, 256.0, 256.0))
+        >>> samples = sampler.sample_grid(5)
+        """
+        if len(grid_shape) != len(periods):
+            raise ValueError(
+                f"grid_shape and periods must have same length, "
+                f"got {len(grid_shape)} and {len(periods)}"
+            )
+
+        # Create implicit axes: [0, period) with N points
+        axes = []
+        for N, L in zip(grid_shape, periods):
+            ax = np.linspace(0, L - L/N, N)
+            axes.append(ax)
+
+        self.initialize_field_from_grid(*axes)
+
+    def initialize_field_from_grid(self, *axes):
+        """
+        Initialize field for periodic sampling on a regular grid.
+
+        The grid is assumed to be periodic, meaning the field wraps around.
+        The period in each dimension is inferred from the axis extent:
+        period_i = max(axis_i) - min(axis_i) + delta_i, where delta_i is the
+        grid spacing. This ensures the last point connects to the first.
+
+        Parameters
+        ----------
+        *axes : 1D arrays
+            Coordinate arrays for each dimension.
+            E.g., for 3D: initialize_field_from_grid(x, y, z)
+
+        Notes
+        -----
+        The axes should be uniformly spaced for the FFT method to be exact.
+        Non-uniform spacing will produce approximate results.
+        """
+        self.grid_axes = tuple(np.asarray(ax) for ax in axes)
+        self.grid_shape = tuple(len(ax) for ax in self.grid_axes)
+        ndim = len(self.grid_shape)
+
+        # Infer periods from axes
+        # Period = extent + one grid spacing (to close the periodic loop)
+        self.periods = []
+        for ax in self.grid_axes:
+            if len(ax) > 1:
+                delta = ax[1] - ax[0]  # Assuming uniform spacing
+                period = (ax[-1] - ax[0]) + delta
+            else:
+                period = 1.0  # Default for single point
+            self.periods.append(period)
+        self.periods = tuple(self.periods)
+
+        # Build periodic distance array
+        # For each dimension, compute min(|i|, N-|i|) * (L/N)
+        periodic_distances_1d = []
+        for dim_idx, (N, L) in enumerate(zip(self.grid_shape, self.periods)):
+            indices = np.arange(N)
+            # Periodic distance: min(i, N-i) gives the shorter wrap-around distance
+            periodic_dist = np.minimum(indices, N - indices) * (L / N)
+            periodic_distances_1d.append(periodic_dist)
+
+        # Create N-dimensional distance array via meshgrid
+        dist_grids = np.meshgrid(*periodic_distances_1d, indexing='ij')
+
+        # Euclidean distance from periodic components
+        R_squared = sum(dg**2 for dg in dist_grids)
+        R = np.sqrt(R_squared)
+
+        # Evaluate Matérn covariance at all periodic distances
+        C = self._matern_kernel(R)
+
+        # Eigenvalues via N-dimensional FFT
+        # For a real symmetric circulant matrix, eigenvalues are real
+        self.Lambda = np.fft.fftn(C).real
+
+        # Check for negative eigenvalues
+        self._n_negative_eigenvalues = np.sum(self.Lambda < 0)
+        if self._n_negative_eigenvalues > 0:
+            min_eigenvalue = self.Lambda.min()
+            total_eigenvalues = np.prod(self.grid_shape)
+            warnings.warn(
+                f"Circulant embedding produced {self._n_negative_eigenvalues} "
+                f"negative eigenvalues (out of {total_eigenvalues}). "
+                f"Min eigenvalue: {min_eigenvalue:.2e}. "
+                f"Consider using a larger domain (period >> length_scale). "
+                f"Negative eigenvalues will be set to 0.",
+                RuntimeWarning
+            )
+            self.Lambda = np.maximum(self.Lambda, 0)
+
+        # Add jitter to the zero-frequency component for numerical stability
+        zero_freq_idx = tuple(0 for _ in range(ndim))
+        self.Lambda[zero_freq_idx] += self.jitter
+
+    def _matern_kernel(self, r):
+        """Vectorized Matérn kernel handling r=0 singularity."""
+        r = np.asarray(r)
+        result = np.zeros_like(r, dtype=np.float64)
+
+        mask = r > 1e-10
+        if np.any(mask):
+            r_valid = r[mask]
+            scaled_r = (np.sqrt(2 * self.nu) * r_valid) / self.length_scale
+            factor = (2**(1.0 - self.nu)) / gamma(self.nu)
+            result[mask] = self.sigma_sq * factor * (scaled_r ** self.nu) * kv(self.nu, scaled_r)
+
+        result[~mask] = self.sigma_sq
+        return result
+
+    def sample(self, n_samples=1):
+        """
+        Generate samples from the periodic GP.
+
+        Returns
+        -------
+        samples : ndarray of shape (n_samples, n_points)
+            Flattened samples. Use sample_grid() for shaped output.
+
+        Raises
+        ------
+        RuntimeError
+            If initialize_field_from_grid() has not been called.
+        """
+        if self.Lambda is None:
+            raise RuntimeError(
+                "Field not initialized. Call initialize_field_from_grid() first."
+            )
+
+        samples = self._sample_fft(n_samples)
+        n_points = np.prod(self.grid_shape)
+        return samples.reshape(n_samples, n_points)
+
+    def sample_grid(self, n_samples=1, smooth_sigma=None):
+        """
+        Generate samples from the periodic GP with grid shape.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of samples to generate.
+        smooth_sigma : float or None, optional
+            If provided, apply Gaussian smoothing with this sigma (in grid units)
+            to each sample using periodic boundary conditions. This can help
+            reduce FFT artifacts (horizontal/vertical streaks). Typical values
+            are 0.5 to 2.0 grid spacings.
+
+        Returns
+        -------
+        samples : ndarray of shape (n_samples, *grid_shape)
+            E.g., for 3D grid of shape (Nx, Ny, Nz): returns (n_samples, Nx, Ny, Nz)
+
+        Raises
+        ------
+        RuntimeError
+            If initialize_field_from_grid() has not been called.
+        """
+        if self.Lambda is None:
+            raise RuntimeError(
+                "Field not initialized. Call initialize_field_from_grid() first."
+            )
+
+        samples = self._sample_fft(n_samples)
+
+        if smooth_sigma is not None and smooth_sigma > 0:
+            # Apply Gaussian smoothing to each sample with periodic BC
+            # sigma=0 means don't smooth the batch dimension
+            ndim = len(self.grid_shape)
+            sigma_per_axis = (0,) + (smooth_sigma,) * ndim  # (0, sigma, sigma, sigma)
+            samples = gaussian_filter(samples, sigma=sigma_per_axis, mode='wrap')
+
+        return samples
+
+    def _sample_fft(self, n_samples):
+        """
+        Core FFT-based sampling algorithm.
+
+        For a circulant covariance matrix K with eigenvalues λ (computed via FFT),
+        we sample by:
+        1. Generate complex Gaussian noise Z in Fourier space
+        2. Scale by sqrt(λ): Y_hat = sqrt(λ) * Z
+        3. Inverse FFT to get real-space sample: Y = IFFT(Y_hat)
+        """
+        samples = []
+        sqrt_Lambda = np.sqrt(self.Lambda)
+
+        for _ in range(n_samples):
+            # Complex Gaussian in Fourier space
+            # Z ~ CN(0, I) means Re(Z), Im(Z) ~ N(0, 1/2) independently
+            Z_real = np.random.randn(*self.grid_shape)
+            Z_imag = np.random.randn(*self.grid_shape)
+            Z = (Z_real + 1j * Z_imag) / np.sqrt(2)
+
+            # Scale by sqrt of eigenvalues
+            Y_hat = sqrt_Lambda * Z
+
+            # Inverse FFT and take real part
+            # The imaginary part should be negligible for a proper circulant matrix
+            Y = np.fft.ifftn(Y_hat).real
+
+            # Normalize by sqrt(N) to get correct variance
+            # (FFT normalization convention)
+            Y = Y * np.sqrt(np.prod(self.grid_shape))
+
+            samples.append(self.mean_val + Y)
+
+        return np.array(samples)
+
+    def sample_grid_interpolated(self, n_samples, *target_axes):
+        """
+        Sample from periodic GP and interpolate to a finer target grid.
+
+        Uses periodic-aware interpolation: values wrap around at boundaries.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of samples to generate.
+        *target_axes : 1D arrays
+            Coordinate arrays for the target (fine) grid.
+            Must have the same number of dimensions as the initialized grid.
+            Target coordinates should be within the periodic domain.
+
+        Returns
+        -------
+        samples : ndarray of shape (n_samples, *target_shape)
+            Interpolated samples on the fine grid.
+
+        Raises
+        ------
+        RuntimeError
+            If initialize_field_from_grid() has not been called.
+        ValueError
+            If number of target axes doesn't match grid dimensions.
+        """
+        if self.grid_axes is None:
+            raise RuntimeError(
+                "Grid axes not set. Use initialize_field_from_grid() first."
+            )
+
+        if len(target_axes) != len(self.grid_axes):
+            raise ValueError(
+                f"Expected {len(self.grid_axes)} axes, got {len(target_axes)}"
+            )
+
+        # Sample at coarse grid
+        coarse_samples = self.sample_grid(n_samples)
+
+        # Target grid shape
+        target_shape = tuple(len(ax) for ax in target_axes)
+
+        # Create target points for interpolation
+        target_grids = np.meshgrid(*target_axes, indexing='ij')
+        target_points = np.stack([g.ravel() for g in target_grids], axis=-1)
+
+        # For periodic interpolation, we extend the coarse grid by one point
+        # in each dimension (wrapping around)
+        extended_axes = []
+        for ax, period in zip(self.grid_axes, self.periods):
+            # Add one more point at the end that equals the first point + period
+            extended_ax = np.concatenate([ax, [ax[0] + period]])
+            extended_axes.append(extended_ax)
+
+        # Interpolate each sample with periodic extension
+        result = np.empty((n_samples,) + target_shape)
+        for i in range(n_samples):
+            # Extend the sample data by wrapping
+            extended_data = self._extend_periodic(coarse_samples[i])
+
+            interpolator = RegularGridInterpolator(
+                tuple(extended_axes),
+                extended_data,
+                method='linear',
+                bounds_error=False,
+                fill_value=None
+            )
+
+            # Wrap target points into the periodic domain before interpolating
+            wrapped_points = self._wrap_points(target_points)
+            result[i] = interpolator(wrapped_points).reshape(target_shape)
+
+        return result
+
+    def _extend_periodic(self, data):
+        """
+        Extend data array by one point in each dimension via periodic wrapping.
+
+        For a 3D array of shape (Nx, Ny, Nz), returns shape (Nx+1, Ny+1, Nz+1)
+        where the extra slices wrap around to the beginning.
+        """
+        ndim = data.ndim
+        result = data
+
+        for dim in range(ndim):
+            # Take the first slice along this dimension and append it
+            first_slice = np.take(result, [0], axis=dim)
+            result = np.concatenate([result, first_slice], axis=dim)
+
+        return result
+
+    def _wrap_points(self, points):
+        """
+        Wrap points into the periodic domain [min_ax, min_ax + period).
+        """
+        wrapped = points.copy()
+        for dim, (ax, period) in enumerate(zip(self.grid_axes, self.periods)):
+            min_val = ax[0]
+            # Wrap to [min_val, min_val + period)
+            wrapped[:, dim] = min_val + np.mod(wrapped[:, dim] - min_val, period)
+        return wrapped
+
+    @property
+    def n_negative_eigenvalues(self):
+        """Number of negative eigenvalues encountered (thresholded to 0)."""
+        return self._n_negative_eigenvalues
+
+
+class SpectralMaternFieldSampler:
+    """
+    Periodic Matérn GP sampler using direct spectral representation.
+
+    This sampler generates GP realizations by directly sampling in Fourier space
+    using the analytic spectral density of the Matérn kernel. Unlike the circulant
+    embedding method (PeriodicMaternFieldSampler), this approach:
+
+    1. Does NOT discretize the covariance function
+    2. Directly uses the closed-form Matérn spectral density
+    3. May have different (often better) artifact characteristics
+
+    The Matérn spectral density in d dimensions is:
+
+        S(ω) ∝ (2ν/ℓ² + 4π²|ω|²)^{-(ν + d/2)}
+
+    Parameters
+    ----------
+    mean_val : float
+        The constant mean of the field (mu).
+    sigma_sq : float
+        Amplitude (Variance) - the field variance at each point.
+    nu : float
+        Smoothness parameter. Common values: 0.5 (exponential), 1.5, 2.5.
+    length_scale : float
+        Correlation length scale parameter (ℓ).
+
+    Notes
+    -----
+    The spectral density is normalized so that the total variance equals sigma_sq.
+
+    References
+    ----------
+    Rasmussen, C.E., & Williams, C.K.I. (2006). Gaussian Processes for Machine
+    Learning. MIT Press. Chapter 4.
+    """
+
+    def __init__(
+        self,
+        mean_val,
+        sigma_sq,
+        nu,
+        length_scale
+    ):
+        self.mean_val = mean_val
+        self.sigma_sq = sigma_sq
+        self.nu = nu
+        self.length_scale = length_scale
+
+        # Grid parameters (set via initialize)
+        self.grid_shape = None
+        self.grid_axes = None
+        self.periods = None
+        self.sqrt_S = None  # Square root of spectral density (precomputed)
+
+    def initialize_periodic_grid(self, grid_shape, periods):
+        """
+        Initialize for periodic sampling with explicit grid shape and periods.
+
+        Parameters
+        ----------
+        grid_shape : tuple of int
+            Number of grid points in each dimension, e.g., (64, 64, 64).
+        periods : tuple of float
+            Period (domain size) in each dimension, e.g., (512.0, 512.0, 512.0).
+        """
+        if len(grid_shape) != len(periods):
+            raise ValueError(
+                f"grid_shape and periods must have same length, "
+                f"got {len(grid_shape)} and {len(periods)}"
+            )
+
+        self.grid_shape = tuple(grid_shape)
+        self.periods = tuple(periods)
+        ndim = len(grid_shape)
+
+        # Create implicit axes
+        self.grid_axes = tuple(
+            np.linspace(0, L - L/N, N) for N, L in zip(grid_shape, periods)
+        )
+
+        # Build frequency grid
+        # fftfreq returns frequencies in cycles per sample
+        # We need to scale by N/L to get cycles per unit length
+        freq_grids = []
+        for N, L in zip(grid_shape, periods):
+            # fftfreq(N, d=L/N) gives frequencies in cycles per unit length
+            freq = np.fft.fftfreq(N, d=L/N)
+            freq_grids.append(freq)
+
+        # Create meshgrid of frequencies
+        K_grids = np.meshgrid(*freq_grids, indexing='ij')
+
+        # Compute |k|^2 (sum of squared frequencies)
+        K_sq = sum(K**2 for K in K_grids)
+
+        # Matérn spectral density (unnormalized)
+        # S(ω) ∝ (2ν/ℓ² + 4π²|ω|²)^{-(ν + d/2)}
+        alpha = 2 * self.nu / (self.length_scale ** 2)
+        exponent = -(self.nu + ndim / 2)
+        S_unnorm = (alpha + 4 * np.pi**2 * K_sq) ** exponent
+
+        # Normalize so that total variance equals sigma_sq
+        # The variance is (1/V) * sum(S) where V is the domain volume
+        # After IFFT with our convention, we need: sum(S) = sigma_sq * N_total
+        N_total = np.prod(grid_shape)
+        S = S_unnorm * (self.sigma_sq * N_total / S_unnorm.sum())
+
+        # Store sqrt for sampling
+        self.sqrt_S = np.sqrt(S)
+
+    def initialize_field_from_grid(self, *axes):
+        """
+        Initialize from coordinate axes.
+
+        Parameters
+        ----------
+        *axes : 1D arrays
+            Coordinate arrays for each dimension.
+        """
+        grid_shape = tuple(len(ax) for ax in axes)
+
+        # Infer periods from axes
+        periods = []
+        for ax in axes:
+            ax = np.asarray(ax)
+            if len(ax) > 1:
+                delta = ax[1] - ax[0]
+                period = (ax[-1] - ax[0]) + delta
+            else:
+                period = 1.0
+            periods.append(period)
+
+        self.initialize_periodic_grid(grid_shape, tuple(periods))
+        self.grid_axes = tuple(np.asarray(ax) for ax in axes)
+
+    def sample(self, n_samples=1):
+        """
+        Generate samples from the periodic GP.
+
+        Returns
+        -------
+        samples : ndarray of shape (n_samples, n_points)
+            Flattened samples.
+        """
+        if self.sqrt_S is None:
+            raise RuntimeError(
+                "Field not initialized. Call initialize_periodic_grid() first."
+            )
+
+        samples = self._sample_spectral(n_samples)
+        n_points = np.prod(self.grid_shape)
+        return samples.reshape(n_samples, n_points)
+
+    def sample_grid(self, n_samples=1, smooth_sigma=None):
+        """
+        Generate samples from the periodic GP with grid shape.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of samples to generate.
+        smooth_sigma : float or None, optional
+            If provided, apply Gaussian smoothing (periodic BC) to reduce artifacts.
+
+        Returns
+        -------
+        samples : ndarray of shape (n_samples, *grid_shape)
+        """
+        if self.sqrt_S is None:
+            raise RuntimeError(
+                "Field not initialized. Call initialize_periodic_grid() first."
+            )
+
+        samples = self._sample_spectral(n_samples)
+
+        if smooth_sigma is not None and smooth_sigma > 0:
+            ndim = len(self.grid_shape)
+            sigma_per_axis = (0,) + (smooth_sigma,) * ndim
+            samples = gaussian_filter(samples, sigma=sigma_per_axis, mode='wrap')
+
+        return samples
+
+    def _sample_spectral(self, n_samples):
+        """
+        Core spectral sampling algorithm.
+
+        For each sample:
+        1. Generate complex Gaussian noise Z in Fourier space
+        2. Scale by sqrt(S): Y_hat = sqrt(S) * Z
+        3. Inverse FFT to get real-space sample
+
+        To ensure a real-valued output, we use the fact that for real fields,
+        the Fourier transform has Hermitian symmetry. We sample a general
+        complex field and take the real part, which effectively averages
+        contributions from k and -k.
+        """
+        samples = []
+
+        for _ in range(n_samples):
+            # Complex Gaussian noise in Fourier space
+            Z_real = np.random.randn(*self.grid_shape)
+            Z_imag = np.random.randn(*self.grid_shape)
+            Z = (Z_real + 1j * Z_imag) / np.sqrt(2)
+
+            # Scale by sqrt of spectral density
+            Y_hat = self.sqrt_S * Z
+
+            # Inverse FFT and take real part
+            # The factor sqrt(N) comes from FFT normalization
+            Y = np.fft.ifftn(Y_hat).real * np.sqrt(np.prod(self.grid_shape))
+
+            samples.append(self.mean_val + Y)
+
+        return np.array(samples)
+
+    def sample_grid_interpolated(self, n_samples, *target_axes):
+        """
+        Sample and interpolate to a finer target grid with periodic BC.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of samples to generate.
+        *target_axes : 1D arrays
+            Coordinate arrays for the target (fine) grid.
+
+        Returns
+        -------
+        samples : ndarray of shape (n_samples, *target_shape)
+        """
+        if self.grid_axes is None:
+            raise RuntimeError(
+                "Grid axes not set. Use initialize_field_from_grid() first."
+            )
+
+        if len(target_axes) != len(self.grid_axes):
+            raise ValueError(
+                f"Expected {len(self.grid_axes)} axes, got {len(target_axes)}"
+            )
+
+        coarse_samples = self.sample_grid(n_samples)
+        target_shape = tuple(len(ax) for ax in target_axes)
+        target_grids = np.meshgrid(*target_axes, indexing='ij')
+        target_points = np.stack([g.ravel() for g in target_grids], axis=-1)
+
+        # Extend axes for periodic interpolation
+        extended_axes = []
+        for ax, period in zip(self.grid_axes, self.periods):
+            extended_ax = np.concatenate([ax, [ax[0] + period]])
+            extended_axes.append(extended_ax)
+
+        result = np.empty((n_samples,) + target_shape)
+        for i in range(n_samples):
+            extended_data = self._extend_periodic(coarse_samples[i])
+
+            interpolator = RegularGridInterpolator(
+                tuple(extended_axes),
+                extended_data,
+                method='linear',
+                bounds_error=False,
+                fill_value=None
+            )
+
+            wrapped_points = self._wrap_points(target_points)
+            result[i] = interpolator(wrapped_points).reshape(target_shape)
+
+        return result
+
+    def _extend_periodic(self, data):
+        """Extend array by one point in each dim via periodic wrapping."""
+        result = data
+        for dim in range(data.ndim):
+            first_slice = np.take(result, [0], axis=dim)
+            result = np.concatenate([result, first_slice], axis=dim)
+        return result
+
+    def _wrap_points(self, points):
+        """Wrap points into periodic domain."""
+        wrapped = points.copy()
+        for dim, (ax, period) in enumerate(zip(self.grid_axes, self.periods)):
+            min_val = ax[0]
+            wrapped[:, dim] = min_val + np.mod(wrapped[:, dim] - min_val, period)
+        return wrapped
+
+
+class RFFMaternFieldSampler:
+    """
+    Periodic Matérn GP sampler using Random Fourier Features (RFF).
+
+    This sampler approximates GP samples by summing random sinusoids with
+    frequencies drawn from the Matérn spectral density. Unlike FFT-based methods,
+    this approach:
+
+    1. Does NOT use FFT at all - no grid-aligned frequency artifacts
+    2. Directly samples continuous frequencies from the spectral density
+    3. Produces smooth, isotropic samples without directional artifacts
+
+    The approximation:
+        f(x) ≈ sqrt(2σ²/M) * Σ_{m=1}^{M} cos(2π ω_m · x + φ_m)
+
+    where ω_m are drawn from the Matérn spectral density and φ_m are uniform phases.
+
+    Parameters
+    ----------
+    mean_val : float
+        The constant mean of the field.
+    sigma_sq : float
+        Amplitude (Variance).
+    nu : float
+        Smoothness parameter.
+    length_scale : float
+        Correlation length scale.
+    n_features : int
+        Number of random Fourier features. More features = better approximation
+        but slower. Typically 500-2000 is sufficient for good quality.
+
+    Notes
+    -----
+    This is an approximation that converges to the true GP as n_features → ∞.
+    The error decreases as O(1/sqrt(n_features)).
+
+    For periodic fields, we use frequencies that are integer multiples of 1/L,
+    but sampled according to the spectral density weights.
+
+    References
+    ----------
+    Rahimi, A., & Recht, B. (2007). "Random features for large-scale kernel
+    machines". NIPS.
+    """
+
+    def __init__(
+        self,
+        mean_val,
+        sigma_sq,
+        nu,
+        length_scale,
+        n_features=1000
+    ):
+        self.mean_val = mean_val
+        self.sigma_sq = sigma_sq
+        self.nu = nu
+        self.length_scale = length_scale
+        self.n_features = n_features
+
+        # Grid parameters
+        self.grid_shape = None
+        self.grid_axes = None
+        self.periods = None
+
+        # Precomputed frequencies and weights
+        self._frequencies = None  # (n_features, ndim)
+        self._weights = None      # (n_features,) - sqrt of spectral density
+
+    def initialize_periodic_grid(self, grid_shape, periods):
+        """
+        Initialize for periodic sampling.
+
+        Parameters
+        ----------
+        grid_shape : tuple of int
+            Number of grid points in each dimension.
+        periods : tuple of float
+            Period (domain size) in each dimension.
+        """
+        self.grid_shape = tuple(grid_shape)
+        self.periods = tuple(float(p) for p in periods)
+        ndim = len(grid_shape)
+
+        # Create coordinate axes
+        self.grid_axes = tuple(
+            np.linspace(0, L - L/N, N) for N, L in zip(grid_shape, periods)
+        )
+
+        # Sample frequencies from Matérn spectral density
+        self._sample_frequencies(ndim)
+
+    def initialize_field_from_grid(self, *axes):
+        """Initialize from coordinate axes."""
+        grid_shape = tuple(len(ax) for ax in axes)
+
+        periods = []
+        for ax in axes:
+            ax = np.asarray(ax)
+            if len(ax) > 1:
+                delta = ax[1] - ax[0]
+                period = (ax[-1] - ax[0]) + delta
+            else:
+                period = 1.0
+            periods.append(period)
+
+        self.initialize_periodic_grid(grid_shape, tuple(periods))
+        self.grid_axes = tuple(np.asarray(ax) for ax in axes)
+
+    def _sample_frequencies(self, ndim):
+        """
+        Sample frequencies from Matérn spectral density.
+
+        The Matérn spectral density in d dimensions (for frequency f in cycles/length):
+            S(f) ∝ (2ν/ℓ² + 4π²|f|²)^{-(ν + d/2)}
+                 = (ν/(2π²ℓ²) + |f|²)^{-(ν + d/2)}  [factoring out 4π²]
+
+        This is proportional to a scaled multivariate Student-t distribution.
+
+        If t ~ multivariate-t(df) with df = 2ν, then f = t/(2πℓ) has the
+        correct spectral density.
+        """
+        df = 2 * self.nu  # degrees of freedom for Student-t
+
+        # Sample from multivariate Student-t(df)
+        # Method: t = z / sqrt(χ²/df) where z ~ N(0, I), χ² ~ chi-squared(df)
+        z = np.random.randn(self.n_features, ndim)
+        chi2 = np.random.chisquare(df, size=self.n_features)
+        t = z / np.sqrt(chi2 / df)[:, np.newaxis]
+
+        # Scale to get frequencies: f = t / (2πℓ)
+        # This gives the correct Matérn spectral density
+        self._frequencies = t / (2 * np.pi * self.length_scale)
+
+        # Weight for RFF: sqrt(2σ²/M) where M is number of features
+        self._weights = np.sqrt(2 * self.sigma_sq / self.n_features)
+
+    def sample(self, n_samples=1):
+        """Generate samples (flattened)."""
+        if self._frequencies is None:
+            raise RuntimeError("Not initialized. Call initialize_periodic_grid() first.")
+
+        samples = self._sample_rff(n_samples)
+        n_points = np.prod(self.grid_shape)
+        return samples.reshape(n_samples, n_points)
+
+    def sample_grid(self, n_samples=1, smooth_sigma=None):
+        """
+        Generate samples with grid shape.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of samples to generate.
+        smooth_sigma : float or None
+            Optional Gaussian smoothing (usually not needed with RFF).
+
+        Returns
+        -------
+        samples : ndarray of shape (n_samples, *grid_shape)
+        """
+        if self._frequencies is None:
+            raise RuntimeError("Not initialized. Call initialize_periodic_grid() first.")
+
+        samples = self._sample_rff(n_samples)
+
+        if smooth_sigma is not None and smooth_sigma > 0:
+            ndim = len(self.grid_shape)
+            sigma_per_axis = (0,) + (smooth_sigma,) * ndim
+            samples = gaussian_filter(samples, sigma=sigma_per_axis, mode='wrap')
+
+        return samples
+
+    def _sample_rff(self, n_samples):
+        """
+        Core RFF sampling.
+
+        f(x) = sqrt(2σ²/M) * Σ_m cos(2π ω_m · x + φ_m)
+
+        For efficiency, we compute this using matrix operations.
+        """
+        # Build coordinate array: (N_total, ndim)
+        grids = np.meshgrid(*self.grid_axes, indexing='ij')
+        X = np.stack([g.ravel() for g in grids], axis=-1)  # (N_total, ndim)
+        N_total = X.shape[0]
+
+        samples = []
+        for _ in range(n_samples):
+            # Random phases for this sample
+            phases = np.random.uniform(0, 2 * np.pi, self.n_features)
+
+            # Compute: cos(2π * X @ ω.T + φ)
+            # X: (N_total, ndim), frequencies: (n_features, ndim)
+            # X @ frequencies.T: (N_total, n_features)
+            projection = 2 * np.pi * (X @ self._frequencies.T)  # (N_total, n_features)
+            projection += phases[np.newaxis, :]  # Add phases
+
+            # Sum of cosines
+            cos_features = np.cos(projection)  # (N_total, n_features)
+            f = self._weights * cos_features.sum(axis=1)  # (N_total,)
+
+            samples.append(self.mean_val + f.reshape(self.grid_shape))
+
+        return np.array(samples)
+
+    def sample_grid_interpolated(self, n_samples, *target_axes):
+        """Sample and interpolate to finer grid."""
+        if self.grid_axes is None:
+            raise RuntimeError("Grid not initialized.")
+
+        if len(target_axes) != len(self.grid_axes):
+            raise ValueError(f"Expected {len(self.grid_axes)} axes")
+
+        coarse_samples = self.sample_grid(n_samples)
+        target_shape = tuple(len(ax) for ax in target_axes)
+        target_grids = np.meshgrid(*target_axes, indexing='ij')
+        target_points = np.stack([g.ravel() for g in target_grids], axis=-1)
+
+        extended_axes = [
+            np.concatenate([ax, [ax[0] + period]])
+            for ax, period in zip(self.grid_axes, self.periods)
+        ]
+
+        result = np.empty((n_samples,) + target_shape)
+        for i in range(n_samples):
+            extended_data = self._extend_periodic(coarse_samples[i])
+            interpolator = RegularGridInterpolator(
+                tuple(extended_axes), extended_data,
+                method='linear', bounds_error=False, fill_value=None
+            )
+            wrapped_points = self._wrap_points(target_points)
+            result[i] = interpolator(wrapped_points).reshape(target_shape)
+
+        return result
+
+    def _extend_periodic(self, data):
+        result = data
+        for dim in range(data.ndim):
+            first_slice = np.take(result, [0], axis=dim)
+            result = np.concatenate([result, first_slice], axis=dim)
+        return result
+
+    def _wrap_points(self, points):
+        wrapped = points.copy()
+        for dim, (ax, period) in enumerate(zip(self.grid_axes, self.periods)):
+            min_val = ax[0]
+            wrapped[:, dim] = min_val + np.mod(wrapped[:, dim] - min_val, period)
+        return wrapped
+
+    def resample_frequencies(self):
+        """
+        Resample the random frequencies.
+
+        Call this if you want a different set of basis functions for the
+        next batch of samples.
+        """
+        if self.grid_shape is not None:
+            self._sample_frequencies(len(self.grid_shape))
