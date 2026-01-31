@@ -143,12 +143,22 @@ VOLUME_PATHS = {
 }
 
 # Porosity field volumes (precomputed local mean porosity)
-POROSITY_DIR = '/home/ubuntu/repos/DiffSci2/notebooks/exploratory/dfn/data/gpdata2/'
-POROSITY_PATHS = {
-    'Bentheimer': POROSITY_DIR + 'bentheimer/Bentheimer_1000c_3p0035um_porosity_field_full.npy',
-    'Doddington': POROSITY_DIR + 'doddington/Doddington_1000c_2p6929um_porosity_field_full.npy',
-    'Estaillades': POROSITY_DIR + 'estaillades/Estaillades_1000c_3p31136um_porosity_field_full.npy',
-    'Ketton': POROSITY_DIR + 'ketton/Ketton_1000c_3p00006um_porosity_field_full.npy',
+# gpdata2: original format with full resolution info in filename
+# gpdata4-129: new format with simpler naming (conv kernel 129)
+POROSITY_BASE_DIR = '/home/ubuntu/repos/DiffSci2/notebooks/exploratory/dfn/data/'
+
+POROSITY_PATHS_GPDATA2 = {
+    'Bentheimer': 'gpdata2/bentheimer/Bentheimer_1000c_3p0035um_porosity_field_full.npy',
+    'Doddington': 'gpdata2/doddington/Doddington_1000c_2p6929um_porosity_field_full.npy',
+    'Estaillades': 'gpdata2/estaillades/Estaillades_1000c_3p31136um_porosity_field_full.npy',
+    'Ketton': 'gpdata2/ketton/Ketton_1000c_3p00006um_porosity_field_full.npy',
+}
+
+POROSITY_PATHS_GPDATA4_129 = {
+    'Bentheimer': 'gpdata4-129/bentheimer/bentheimer_porosity_field_full.npy',
+    'Doddington': 'gpdata4-129/doddington/doddington_porosity_field_full.npy',
+    'Estaillades': 'gpdata4-129/estaillades/estaillades_porosity_field_full.npy',
+    'Ketton': 'gpdata4-129/ketton/ketton_porosity_field_full.npy',
 }
 
 
@@ -450,6 +460,15 @@ def parse_args():
                         choices=['Bentheimer', 'Doddington', 'Estaillades', 'Ketton'],
                         help='Stone type to use (determines data/model paths)')
 
+    # Data source selection
+    parser.add_argument('--data-source', type=str, default='gpdata2',
+                        choices=['gpdata2', 'gpdata4-129'],
+                        help='Porosity field data source (gpdata2=original, gpdata4-129=conv kernel 129)')
+
+    # Center crop option
+    parser.add_argument('--center-crop', type=int, default=None,
+                        help='Center crop margin (e.g., 64 crops [64:-64, 64:-64, 64:-64] from volumes)')
+
     # Override paths (optional, will use defaults based on --stone if not specified)
     parser.add_argument('--data-path', type=str, default=None,
                         help='Override: Path to binary volume .raw file (uint8, 1000x1000x1000)')
@@ -481,8 +500,10 @@ def parse_args():
                         help='Weight decay for AdamW')
     parser.add_argument('--gradient-clip', type=float, default=1.0,
                         help='Gradient clipping value')
-    parser.add_argument('--warmup-steps', type=int, default=1000,
-                        help='Number of warmup steps for LR scheduler')
+    parser.add_argument('--warmup-steps', type=int, default=None,
+                        help='Number of warmup steps for LR scheduler (overrides --warmup-epochs if set)')
+    parser.add_argument('--warmup-epochs', type=int, default=2,
+                        help='Number of epochs for warmup (default: 2, fully ramped by end of epoch 2)')
     parser.add_argument('--ema-decay', type=float, default=0.9999,
                         help='EMA decay rate (0 to disable)')
 
@@ -513,26 +534,41 @@ def main():
     args = parse_args()
 
     # =========================================================================
-    # STEP 0: Resolve paths based on stone type
+    # STEP 0: Resolve paths based on stone type and data source
     # =========================================================================
     stone = args.stone
     data_path = args.data_path or VOLUME_PATHS[stone]
-    porosity_path = args.porosity_path or POROSITY_PATHS[stone]
+
+    # Select porosity path based on data source
+    if args.porosity_path:
+        porosity_path = args.porosity_path
+    elif args.data_source == 'gpdata2':
+        porosity_path = POROSITY_BASE_DIR + POROSITY_PATHS_GPDATA2[stone]
+    elif args.data_source == 'gpdata4-129':
+        porosity_path = POROSITY_BASE_DIR + POROSITY_PATHS_GPDATA4_129[stone]
+    else:
+        raise ValueError(f"Unknown data source: {args.data_source}")
 
     # Default checkpoint directory with date
+    # Include data source info in checkpoint name (e.g., 129 for gpdata4-129)
     if args.checkpoint_dir is None:
         from datetime import datetime
         date_str = datetime.now().strftime('%Y%m%d')
-        checkpoint_dir = f'models/experimental/{date_str}-dfn-{stone.lower()}-porosity-field'
+        if args.data_source == 'gpdata4-129':
+            checkpoint_dir = f'models/experimental/{date_str}-dfn-{stone.lower()}-129-porosity-field'
+        else:
+            checkpoint_dir = f'models/experimental/{date_str}-dfn-{stone.lower()}-porosity-field'
     else:
         checkpoint_dir = args.checkpoint_dir
 
     print("=" * 60)
     print(f"Porosity Field Training: {stone}")
     print("=" * 60)
+    print(f"  Data source: {args.data_source}")
     print(f"  Data path: {data_path}")
     print(f"  Porosity path: {porosity_path}")
     print(f"  Checkpoint dir: {checkpoint_dir}")
+    print(f"  Center crop: {args.center_crop}")
     print(f"  Effective batch size: {args.batch_size} x {args.accumulate_grad_batches} = {args.batch_size * args.accumulate_grad_batches}")
     print()
 
@@ -562,6 +598,17 @@ def main():
     assert volume_data.shape == porosity_data.shape, (
         f"Volume shape {volume_data.shape} != Porosity shape {porosity_data.shape}"
     )
+
+    # =========================================================================
+    # STEP 1.5: Apply center crop if specified
+    # =========================================================================
+    if args.center_crop is not None:
+        c = args.center_crop
+        print(f"\nApplying center crop [{c}:-{c}, {c}:-{c}, {c}:-{c}]")
+        print(f"  Original shape: {volume_data.shape}")
+        volume_data = volume_data[c:-c, c:-c, c:-c]
+        porosity_data = porosity_data[c:-c, c:-c, c:-c]
+        print(f"  Cropped shape: {volume_data.shape}")
 
     # =========================================================================
     # STEP 2: Split volumes into train/val
@@ -687,14 +734,20 @@ def main():
     steps_per_epoch = len(train_loader)
     total_steps = args.max_epochs * steps_per_epoch
 
+    # Calculate warmup steps: explicit value or based on warmup_epochs
+    if args.warmup_steps is not None:
+        warmup_steps = args.warmup_steps
+    else:
+        warmup_steps = args.warmup_epochs * steps_per_epoch
+
     print(f"  Steps per epoch: {steps_per_epoch}")
     print(f"  Total training steps: {total_steps}")
-    print(f"  Warmup steps: {args.warmup_steps}")
+    print(f"  Warmup steps: {warmup_steps} ({warmup_steps / steps_per_epoch:.1f} epochs)")
 
     # Cosine scheduler with warmup
     scheduler = WarmupCosineScheduler(
         optimizer,
-        warmup_steps=args.warmup_steps,
+        warmup_steps=warmup_steps,
         total_steps=total_steps,
         min_lr_ratio=0.01  # Final LR = 1% of initial
     )
