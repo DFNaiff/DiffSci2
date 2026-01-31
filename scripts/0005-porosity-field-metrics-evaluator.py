@@ -174,14 +174,14 @@ def extract_strided_subvolumes(volume, subvolume_size, n_per_side=None):
     return subvolumes, n
 
 
-def load_generated_data(data_dir, size):
-    """Load all generated volumes of a given size."""
+def get_generated_volume_paths(data_dir, size):
+    """Get paths to all generated volumes of a given size (lazy loading)."""
     files = os.listdir(data_dir)
-    volumes = []
+    paths = []
     for f in sorted(files):
-        if f.startswith(f'{size}_') and f.endswith('.npy') and not f.endswith('.porosity.npy'):
-            volumes.append(np.load(os.path.join(data_dir, f)))
-    return volumes
+        if f.startswith(f'{size}_') and f.endswith('.npy') and f.count('.') == 1:
+            paths.append(os.path.join(data_dir, f))
+    return paths
 
 
 def center_crop(volume, border):
@@ -320,41 +320,52 @@ def main():
         print(f"\nProcessing generated {size}^3 volumes...")
         t_start = time.time()
 
-        volumes = load_generated_data(generated_dir, size)
-        if len(volumes) == 0:
+        volume_paths = get_generated_volume_paths(generated_dir, size)
+        if len(volume_paths) == 0:
             print(f"  No {size}^3 volumes found, skipping")
             continue
 
-        print(f"  Loaded {len(volumes)} volumes")
+        print(f"  Found {len(volume_paths)} volumes")
 
-        # Apply border crop if specified
-        if args.border_crop > 0:
-            cropped_size = size - 2 * args.border_crop
-            print(f"  Applying border crop of {args.border_crop} -> {cropped_size}^3")
-            volumes = [center_crop(v, args.border_crop) for v in volumes]
-
-        # Extract subvolumes if needed
+        # Compute effective size after crop
         effective_size = size - 2 * args.border_crop if args.border_crop > 0 else size
+        if args.border_crop > 0:
+            print(f"  Will apply border crop of {args.border_crop} -> {effective_size}^3")
+
+        # Process volumes one at a time to save memory
+        all_subvolumes = []
+        n_per_side = None
+        for vol_idx, vol_path in enumerate(volume_paths):
+            print(f"  Loading volume {vol_idx + 1}/{len(volume_paths)}: {os.path.basename(vol_path)}")
+            volume = np.load(vol_path)
+
+            # Apply border crop if specified
+            if args.border_crop > 0:
+                volume = center_crop(volume, args.border_crop)
+
+            # Extract subvolumes if needed
+            if args.full_volume:
+                subvolumes = [volume]
+                n_per_side = 1
+            elif effective_size == args.subvolume_size and args.subvolumes_per_side is None:
+                subvolumes = [volume]
+                n_per_side = 1
+            else:
+                subvolumes, n_per_side = extract_strided_subvolumes(volume, args.subvolume_size, args.subvolumes_per_side)
+
+            all_subvolumes.extend(subvolumes)
+
+            # Free memory
+            del volume
+
         if args.full_volume:
-            # Use each volume as-is (no subvolume extraction)
-            subvolumes = volumes
-            n_per_side = 1
-            print(f"  Using {len(subvolumes)} full volumes")
-        elif effective_size == args.subvolume_size and args.subvolumes_per_side is None:
-            subvolumes = volumes
-            n_per_side = 1
-            print(f"  Total subvolumes: {len(subvolumes)}")
+            print(f"  Using {len(all_subvolumes)} full volumes")
         else:
-            subvolumes = []
-            n_per_side = None
-            for volume in volumes:
-                subs, n_per_side = extract_strided_subvolumes(volume, args.subvolume_size, args.subvolumes_per_side)
-                subvolumes.extend(subs)
-            print(f"  Total subvolumes: {len(subvolumes)} ({n_per_side}^3 per volume)")
+            print(f"  Total subvolumes: {len(all_subvolumes)} ({n_per_side}^3 per volume)")
 
         # Compute metrics
         print(f"  Computing metrics...")
-        metrics = extract_metrics(subvolumes, extractor)
+        metrics = extract_metrics(all_subvolumes, extractor)
         timing[f'generated_{size}'] = time.time() - t_start
 
         print(f"  Metrics computed in {timing[f'generated_{size}']:.2f}s")
@@ -368,8 +379,8 @@ def main():
         # Store results
         results[f'generated_{size}_porosity'] = metrics['porosity']
         results[f'generated_{size}_permeability'] = metrics['permeability']
-        results[f'generated_{size}_n_volumes'] = len(volumes)
-        results[f'generated_{size}_n_subvolumes'] = len(subvolumes)
+        results[f'generated_{size}_n_volumes'] = len(volume_paths)
+        results[f'generated_{size}_n_subvolumes'] = len(all_subvolumes)
 
     # Add timing and metadata
     results['timing'] = timing

@@ -38,15 +38,15 @@ AVAILABLE_STONES = ['Bentheimer', 'Doddington', 'Estaillades', 'Ketton']
 # Constants
 LATENT_TO_PIXEL_FACTOR = 8  # pixel_size = latent_size * 8
 MIN_LATENT_MULTIPLE = 16    # latent_size must be multiple of 16
-DILATION_FACTOR = 8         # Same as LATENT_TO_PIXEL_FACTOR
+DILATION_FACTOR = 1         # Working in latent space (no dilation needed)
 
-# Paths to GP analysis data
-GPDATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'notebooks', 'exploratory', 'dfn', 'data', 'gpdata2')
+# Paths to GP analysis data (fitted in latent space with voxel_size=1.0)
+GPDATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'notebooks', 'exploratory', 'dfn', 'data', 'gpdata3c')
 GPDATA_PATHS = {
-    'Bentheimer': os.path.join(GPDATA_DIR, 'bentheimer', 'Bentheimer_1000c_3p0035um_porosity_analysis.npz'),
-    'Doddington': os.path.join(GPDATA_DIR, 'doddington', 'Doddington_1000c_2p6929um_porosity_analysis.npz'),
-    'Estaillades': os.path.join(GPDATA_DIR, 'estaillades', 'Estaillades_1000c_3p31136um_porosity_analysis.npz'),
-    'Ketton': os.path.join(GPDATA_DIR, 'ketton', 'Ketton_1000c_3p00006um_porosity_analysis.npz'),
+    'Bentheimer': os.path.join(GPDATA_DIR, 'bentheimer', 'bentheimer_porosity_analysis.npz'),
+    'Doddington': os.path.join(GPDATA_DIR, 'doddington', 'doddington_porosity_analysis.npz'),
+    'Estaillades': os.path.join(GPDATA_DIR, 'estaillades', 'estaillades_porosity_analysis.npz'),
+    'Ketton': os.path.join(GPDATA_DIR, 'ketton', 'ketton_porosity_analysis.npz'),
 }
 
 
@@ -71,7 +71,7 @@ def parse_args():
         help='Device for computation'
     )
     parser.add_argument(
-        '--coarse-n', type=int, default=16,
+        '--coarse-n', type=int, default=32,
         help='Coarse grid size for GP sampling (default: 16)'
     )
     parser.add_argument(
@@ -101,6 +101,14 @@ def parse_args():
     parser.add_argument(
         '--no-binarize', action='store_true',
         help='Save raw float values instead of binarized (bool) volumes'
+    )
+    parser.add_argument(
+        '--nfields', type=int, default=None,
+        help='Number of porosity fields to sample (enables variance test mode)'
+    )
+    parser.add_argument(
+        '--nsamples-per-field', type=int, default=None,
+        help='Number of volume samples per porosity field (enables variance test mode)'
     )
     return parser.parse_args()
 
@@ -160,8 +168,8 @@ def sample_porosity_field(sampler, latent_shape, coarse_n: int = 16):
     """
     Sample a porosity field for conditioning the latent diffusion model.
 
-    The field is sampled in pixel-space coordinates (dilated by DILATION_FACTOR)
-    to match the physical scale of the original data.
+    The field is sampled in latent space coordinates (DILATION_FACTOR=1).
+    GP parameters are fitted directly in latent space, so no dilation is needed.
     """
     import scipy.special
 
@@ -200,7 +208,7 @@ def sample_periodic_porosity_field(sampler, shape, coarse_n):
 
     # Create coordinate grid matching the shape
     axes = [np.linspace(0, s, s) for s in shape]
-    sampler.initialize_field_from_grid(*axes)
+    sampler.initialize_ficreate_periodic_porosity_samplereld_from_grid(*axes)
 
     # Sample the field
     field = sampler.sample_grid(1)[0]
@@ -239,9 +247,18 @@ def load_models(checkpoint_path, device, periodic=False):
     return flowmodule, vaemodule
 
 
-def generate_volume(flowmodule, vaemodule, sampler, pixel_size, coarse_n, nsteps, device, guidance=1.0, periodic=False):
+def sample_new_porosity_field(sampler, pixel_size, coarse_n, periodic=False):
+    """Sample a new porosity field for the given pixel size."""
+    latent_size = pixel_size // LATENT_TO_PIXEL_FACTOR
+    if periodic:
+        return sample_periodic_porosity_field(sampler, [latent_size, latent_size, latent_size], coarse_n)
+    else:
+        return sample_porosity_field(sampler, [latent_size, latent_size, latent_size], coarse_n)
+
+
+def generate_volume_from_field(flowmodule, vaemodule, porosity_field, pixel_size, nsteps, device, guidance=1.0, periodic=False):
     """
-    Generate a single volume at the specified pixel size.
+    Generate a single volume conditioned on a given porosity field.
 
     Parameters
     ----------
@@ -249,12 +266,10 @@ def generate_volume(flowmodule, vaemodule, sampler, pixel_size, coarse_n, nsteps
         Flow model module.
     vaemodule : VAEModule
         Autoencoder module.
-    sampler : MaternFieldSampler or PeriodicMaternFieldSampler
-        GP sampler for porosity field.
+    porosity_field : ndarray
+        Porosity field at latent resolution.
     pixel_size : int
         Target volume size in pixels (must be multiple of 128).
-    coarse_n : int
-        Coarse grid size for GP sampling.
     nsteps : int
         Number of diffusion steps.
     device : str
@@ -268,45 +283,26 @@ def generate_volume(flowmodule, vaemodule, sampler, pixel_size, coarse_n, nsteps
     -------
     volume : ndarray
         Generated volume of shape (pixel_size, pixel_size, pixel_size).
-    porosity_field : ndarray
-        The porosity field used for conditioning (latent resolution).
     """
     latent_size = pixel_size // LATENT_TO_PIXEL_FACTOR
 
-    # Sample porosity field at latent resolution
-    if periodic:
-        porosity_field = sample_periodic_porosity_field(sampler, [latent_size, latent_size, latent_size], coarse_n)
-    else:
-        porosity_field = sample_porosity_field(sampler, [latent_size, latent_size, latent_size], coarse_n)
     porosity_tensor = torch.tensor(porosity_field, dtype=torch.float32)
     y = {'porosity': porosity_tensor}
 
-    # For 256 (latent 32), we can sample directly without chunk decode
-    # For larger sizes, we need chunk decode
     use_chunk_decode = (pixel_size > 256)
-
-    # Set periodicity for chunk decode
     periodicity = [True, True, True] if periodic else [False, False, False]
 
     if use_chunk_decode:
-        # Sample in latent space
         x_latent = flowmodule.sample(
             1, shape=[4, latent_size, latent_size, latent_size],
             y=y, nsteps=nsteps,
             is_latent_shape=True, return_latents=True, guidance=guidance
         )
 
-        # Chunk decode
         chunk_decode_2.prepare_decoder_for_cached_decode(vaemodule.decoder)
         vaemodule.decoder.to(device)
 
-        # Adjust chunk size based on volume size
-        if pixel_size <= 512:
-            chunk_size = [40, 40, 40]
-        elif pixel_size <= 1024:
-            chunk_size = [40, 40, 40]
-        else:
-            chunk_size = [40, 40, 40]
+        chunk_size = [40, 40, 40]
 
         x = chunk_decode_2.chunk_decode_3d(
             vaemodule.decoder,
@@ -318,11 +314,17 @@ def generate_volume(flowmodule, vaemodule, sampler, pixel_size, coarse_n, nsteps
         )
         x = x[0][0].cpu().numpy()
     else:
-        # Direct sampling at pixel resolution (for 256)
         x = flowmodule.sample(1, shape=[1, pixel_size, pixel_size, pixel_size], y=y, nsteps=nsteps, guidance=guidance)
         x = x[0][0].cpu().numpy()
 
     torch.cuda.empty_cache()
+    return x
+
+
+def generate_volume(flowmodule, vaemodule, sampler, pixel_size, coarse_n, nsteps, device, guidance=1.0, periodic=False):
+    """Generate a single volume: sample a new porosity field and generate from it."""
+    porosity_field = sample_new_porosity_field(sampler, pixel_size, coarse_n, periodic)
+    x = generate_volume_from_field(flowmodule, vaemodule, porosity_field, pixel_size, nsteps, device, guidance, periodic)
     return x, porosity_field
 
 
@@ -382,39 +384,83 @@ def main():
     print(f"  Matern params: sigma^2={gpdata['matern_sigma_sq']:.4f}, "
           f"nu={gpdata['matern_nu']:.4f}, l={gpdata['matern_length_scale']:.4f}")
 
+    # Determine mode: variance test or standard
+    variance_test = args.nfields is not None and args.nsamples_per_field is not None
+
     # Generate volumes for each size
     for pixel_size, n_samples in zip(volume_sizes, volume_samples):
         if n_samples <= 0:
             continue
 
         latent_size = pixel_size // LATENT_TO_PIXEL_FACTOR
-        print(f"\nGenerating {n_samples} x {pixel_size}^3 samples (latent: {latent_size}^3, guidance={args.guidance})...")
 
-        for i in range(n_samples):
-            print(f"  Generating {pixel_size}_{i}...")
-            t_start = time.time()
+        if variance_test:
+            nfields = args.nfields
+            nsamples_per_field = args.nsamples_per_field
+            total = nfields * nsamples_per_field
+            print(f"\nVariance test: {nfields} fields x {nsamples_per_field} samples/field = {total} total")
+            print(f"  {pixel_size}^3 (latent: {latent_size}^3, guidance={args.guidance})")
 
-            x, porosity_field = generate_volume(
-                flowmodule, vaemodule, sampler,
-                pixel_size, args.coarse_n, args.nsteps, args.device, args.guidance,
-                periodic=args.periodic
-            )
+            for f in range(nfields):
+                # Sample one field for this batch
+                porosity_field = sample_new_porosity_field(
+                    sampler, pixel_size, args.coarse_n, periodic=args.periodic
+                )
+                print(f"\n  Field {f}: porosity range [{porosity_field.min():.4f}, {porosity_field.max():.4f}]")
 
-            elapsed = time.time() - t_start
-            timing['samples'].append({'size': pixel_size, 'index': i, 'time': elapsed})
+                if args.save_porosity:
+                    porosity_path = os.path.join(data_dir, f'{pixel_size}_field_{f}.porosity.npy')
+                    np.save(porosity_path, porosity_field)
+                    print(f"    Saved porosity to {porosity_path}")
 
-            # Binarize by default (threshold at mean)
-            if not args.no_binarize:
-                x = (x > x.mean()).astype(bool)
+                for s in range(nsamples_per_field):
+                    print(f"    Generating {pixel_size}_{s}_{f}...")
+                    t_start = time.time()
 
-            output_path = os.path.join(data_dir, f'{pixel_size}_{i}.npy')
-            np.save(output_path, x)
-            print(f"    Saved to {output_path} ({elapsed:.2f}s, {'float' if args.no_binarize else 'bool'})")
+                    x = generate_volume_from_field(
+                        flowmodule, vaemodule, porosity_field,
+                        pixel_size, args.nsteps, args.device, args.guidance,
+                        periodic=args.periodic
+                    )
 
-            if args.save_porosity:
-                porosity_path = os.path.join(data_dir, f'{pixel_size}_{i}.porosity.npy')
-                np.save(porosity_path, porosity_field)
-                print(f"    Saved porosity to {porosity_path}")
+                    elapsed = time.time() - t_start
+                    timing['samples'].append({'size': pixel_size, 'field': f, 'sample': s, 'time': elapsed})
+
+                    if not args.no_binarize:
+                        x = (x > x.mean()).astype(bool)
+
+                    output_path = os.path.join(data_dir, f'{pixel_size}_{s}_{f}.npy')
+                    np.save(output_path, x)
+                    print(f"      Saved to {output_path} ({elapsed:.2f}s, {'float' if args.no_binarize else 'bool'})")
+
+        else:
+            # Standard mode: each sample gets its own field
+            print(f"\nGenerating {n_samples} x {pixel_size}^3 samples (latent: {latent_size}^3, guidance={args.guidance})...")
+
+            for i in range(n_samples):
+                print(f"  Generating {pixel_size}_{i}...")
+                t_start = time.time()
+
+                x, porosity_field = generate_volume(
+                    flowmodule, vaemodule, sampler,
+                    pixel_size, args.coarse_n, args.nsteps, args.device, args.guidance,
+                    periodic=args.periodic
+                )
+
+                elapsed = time.time() - t_start
+                timing['samples'].append({'size': pixel_size, 'index': i, 'time': elapsed})
+
+                if not args.no_binarize:
+                    x = (x > x.mean()).astype(bool)
+
+                output_path = os.path.join(data_dir, f'{pixel_size}_{i}.npy')
+                np.save(output_path, x)
+                print(f"    Saved to {output_path} ({elapsed:.2f}s, {'float' if args.no_binarize else 'bool'})")
+
+                if args.save_porosity:
+                    porosity_path = os.path.join(data_dir, f'{pixel_size}_{i}.porosity.npy')
+                    np.save(porosity_path, porosity_field)
+                    print(f"    Saved porosity to {porosity_path}")
 
     # Compute summary statistics per size
     for size in volume_sizes:

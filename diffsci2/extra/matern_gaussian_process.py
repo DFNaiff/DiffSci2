@@ -1,11 +1,167 @@
 import warnings
 
 import numpy as np
-from scipy.special import kv, gamma
-from scipy.optimize import curve_fit
+from scipy.special import kv, gamma, expit
+from scipy.stats import norm
+from scipy.optimize import curve_fit, differential_evolution
 from scipy.spatial.distance import cdist
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
+
+
+def warp_from_gpdata(data, gpdata):
+    """
+    Transform data from original space to Gaussian Z-space using learned warping.
+
+    Parameters
+    ----------
+    data : ndarray
+        Data in original space (e.g., porosity field with values in (0, 1)).
+    gpdata : dict-like (npz file)
+        GP data containing warping parameters. Must have key 'method':
+        - 'histogram': uses quantile_probs, quantile_values (empirical CDF)
+        - 'beta': uses beta_a, beta_b (beta distribution)
+        - 'logit': uses mean_logit, variance_logit (logit-normal)
+
+    Returns
+    -------
+    Z : ndarray
+        Data transformed to Gaussian space (approximately N(0, 1) marginals).
+
+    Notes
+    -----
+    - histogram: Z = Φ⁻¹(F̂(data)) where F̂ is the empirical CDF
+    - beta: Z = Φ⁻¹(F_beta(data)) where F_beta is the beta CDF
+    - logit: Z = (logit(data) - mean_logit) / sqrt(variance_logit)
+    """
+    from scipy.stats import beta as beta_dist
+
+    data = np.asarray(data)
+    original_shape = data.shape
+    data_flat = data.ravel()
+
+    method = str(gpdata.get('method', 'logit'))
+    eps = 1e-6
+
+    if method == 'histogram':
+        # Histogram/empirical CDF method: Z = Φ⁻¹(F̂(data))
+        quantile_probs = np.asarray(gpdata['quantile_probs'])
+        quantile_values = np.asarray(gpdata['quantile_values'])
+
+        # Sort for interpolation (empirical CDF)
+        sort_idx = np.argsort(quantile_values)
+        sorted_values = quantile_values[sort_idx]
+        sorted_probs = quantile_probs[sort_idx]
+
+        # Interpolate to get F̂(data)
+        u = np.interp(data_flat, sorted_values, sorted_probs)
+        u = np.clip(u, eps, 1 - eps)
+
+        # Apply Φ⁻¹ to get Z
+        Z_flat = norm.ppf(u)
+
+    elif method == 'beta':
+        # Beta distribution method: Z = Φ⁻¹(F_beta(data))
+        beta_a = float(gpdata['beta_a'])
+        beta_b = float(gpdata['beta_b'])
+
+        # Clamp data
+        data_clamped = np.clip(data_flat, eps, 1 - eps)
+
+        # Apply beta CDF
+        u = beta_dist.cdf(data_clamped, beta_a, beta_b)
+        u = np.clip(u, eps, 1 - eps)
+
+        # Apply Φ⁻¹ to get Z
+        Z_flat = norm.ppf(u)
+
+    else:
+        # Logit method: Z = (logit(data) - mean) / sqrt(var)
+        mean_logit = float(gpdata['mean_logit'])
+        variance_logit = float(gpdata['variance_logit'])
+
+        # Clamp data to (0, 1) to avoid infinite logit values
+        data_clamped = np.clip(data_flat, eps, 1 - eps)
+
+        # Logit transform
+        logit_data = np.log(data_clamped / (1 - data_clamped))
+
+        # Standardize
+        Z_flat = (logit_data - mean_logit) / np.sqrt(variance_logit)
+
+    return Z_flat.reshape(original_shape)
+
+
+def unwarp_from_gpdata(Z, gpdata):
+    """
+    Transform data from Gaussian Z-space back to original space using learned warping.
+
+    Parameters
+    ----------
+    Z : ndarray
+        Data in Gaussian space (approximately N(0, 1) marginals).
+    gpdata : dict-like (npz file)
+        GP data containing warping parameters. Must have key 'method':
+        - 'histogram': uses quantile_probs, quantile_values
+        - 'beta': uses beta_a, beta_b
+        - 'logit': uses mean_logit, variance_logit
+
+    Returns
+    -------
+    data : ndarray
+        Data transformed back to original space (porosity in [0, 1]).
+
+    Notes
+    -----
+    - histogram: data = F̂⁻¹(Φ(Z)) where F̂⁻¹ is the quantile function
+    - beta: data = F_beta⁻¹(Φ(Z)) where F_beta⁻¹ is beta quantile function
+    - logit: data = sigmoid(Z * sqrt(variance_logit) + mean_logit)
+    """
+    from scipy.stats import beta as beta_dist
+
+    Z = np.asarray(Z)
+    original_shape = Z.shape
+    Z_flat = Z.ravel()
+
+    method = str(gpdata.get('method', 'logit'))
+    eps = 1e-6
+
+    if method == 'histogram':
+        # Histogram method: data = F̂⁻¹(Φ(Z))
+        quantile_probs = np.asarray(gpdata['quantile_probs'])
+        quantile_values = np.asarray(gpdata['quantile_values'])
+
+        # Apply Φ(Z) to get u in (0, 1)
+        u = norm.cdf(Z_flat)
+        u = np.clip(u, eps, 1 - eps)
+
+        # Interpolate quantile function F̂⁻¹(u)
+        data_flat = np.interp(u, quantile_probs, quantile_values)
+
+    elif method == 'beta':
+        # Beta method: data = F_beta⁻¹(Φ(Z))
+        beta_a = float(gpdata['beta_a'])
+        beta_b = float(gpdata['beta_b'])
+
+        # Apply Φ(Z) to get u in (0, 1)
+        u = norm.cdf(Z_flat)
+        u = np.clip(u, eps, 1 - eps)
+
+        # Apply beta quantile function (ppf) - support is [0, 1]
+        data_flat = beta_dist.ppf(u, beta_a, beta_b)
+
+    else:
+        # Logit method: data = sigmoid(Z * sqrt(var) + mean)
+        mean_logit = float(gpdata['mean_logit'])
+        variance_logit = float(gpdata['variance_logit'])
+
+        # Un-standardize
+        logit_data = Z_flat * np.sqrt(variance_logit) + mean_logit
+
+        # Inverse logit (sigmoid)
+        data_flat = expit(logit_data)
+
+    return data_flat.reshape(original_shape)
 
 
 def smooth_periodic(field, sigma, mode='wrap'):
@@ -57,6 +213,38 @@ def smooth_periodic(field, sigma, mode='wrap'):
         return gaussian_filter(field, sigma=sigma, mode=mode)
 
 
+def matern_covariance_half(r, sigma_sq, length_scale):
+    """
+    Matérn 1/2 (Exponential) covariance: C(r) = σ² exp(-r/ℓ)
+
+    This is the roughest Matérn kernel (not differentiable).
+    """
+    r = np.asarray(r)
+    return sigma_sq * np.exp(-r / length_scale)
+
+
+def matern_covariance_three_half(r, sigma_sq, length_scale):
+    """
+    Matérn 3/2 covariance: C(r) = σ² (1 + √3 r/ℓ) exp(-√3 r/ℓ)
+
+    Once differentiable kernel.
+    """
+    r = np.asarray(r)
+    sqrt3_r_over_l = np.sqrt(3) * r / length_scale
+    return sigma_sq * (1 + sqrt3_r_over_l) * np.exp(-sqrt3_r_over_l)
+
+
+def matern_covariance_five_half(r, sigma_sq, length_scale):
+    """
+    Matérn 5/2 covariance: C(r) = σ² (1 + √5 r/ℓ + 5r²/(3ℓ²)) exp(-√5 r/ℓ)
+
+    Twice differentiable kernel.
+    """
+    r = np.asarray(r)
+    sqrt5_r_over_l = np.sqrt(5) * r / length_scale
+    return sigma_sq * (1 + sqrt5_r_over_l + (5 * r**2) / (3 * length_scale**2)) * np.exp(-sqrt5_r_over_l)
+
+
 def matern_covariance(r, sigma_sq, nu, length_scale):
     """
     Matérn Covariance Function.
@@ -77,6 +265,15 @@ def matern_covariance(r, sigma_sq, nu, length_scale):
     C(r) : array_like
         Covariance values.
     """
+    # Use analytical formulas for classical cases
+    if np.abs(nu - 0.5) < 1e-10:
+        return matern_covariance_half(r, sigma_sq, length_scale)
+    elif np.abs(nu - 1.5) < 1e-10:
+        return matern_covariance_three_half(r, sigma_sq, length_scale)
+    elif np.abs(nu - 2.5) < 1e-10:
+        return matern_covariance_five_half(r, sigma_sq, length_scale)
+
+    # General case using Bessel functions
     r = np.asarray(r)
 
     # 1. Handle the r=0 singularity safely
@@ -111,8 +308,8 @@ def fit_matern_parameters(r_data, corr_data):
     Fits Matérn parameters (sigma^2, nu, l) to experimental data.
     """
     # 1. Clean Data
-    # Remove NaNs or Infs if they exist
-    valid = np.isfinite(corr_data)
+    # Remove NaNs or Infs if they exist, and exclude r=0
+    valid = np.isfinite(corr_data) & (r_data > 1e-10)
     r_clean = r_data[valid]
     c_clean = corr_data[valid]
 
@@ -151,6 +348,109 @@ def fit_matern_parameters(r_data, corr_data):
     except RuntimeError:
         print("Optimization failed to converge.")
         return None, None
+
+    return popt, pcov
+
+
+def fit_matern_classical(r_data, corr_data, nu):
+    """
+    Fit Matérn parameters for classical nu values (1/2, 3/2, 5/2).
+
+    Uses analytical formulas and robust optimization for 2D parameter space
+    (sigma_sq, length_scale).
+
+    Parameters
+    ----------
+    r_data : array_like
+        Radial distances
+    corr_data : array_like
+        Correlation values
+    nu : float
+        Must be one of 0.5, 1.5, or 2.5
+
+    Returns
+    -------
+    popt : array
+        [sigma_sq, nu, length_scale]
+    pcov : array
+        Covariance matrix (extended to 3x3 with nu variance = 0)
+    """
+    if not np.any(np.abs(nu - np.array([0.5, 1.5, 2.5])) < 1e-10):
+        raise ValueError(f"nu must be 0.5, 1.5, or 2.5, got {nu}")
+
+    # Select the appropriate covariance function
+    if np.abs(nu - 0.5) < 1e-10:
+        cov_func = matern_covariance_half
+    elif np.abs(nu - 1.5) < 1e-10:
+        cov_func = matern_covariance_three_half
+    else:  # nu == 2.5
+        cov_func = matern_covariance_five_half
+
+    # Clean data: remove NaNs/Infs and exclude r=0
+    valid = np.isfinite(corr_data) & (r_data > 1e-10)
+    r_clean = r_data[valid]
+    c_clean = corr_data[valid]
+
+    # Initial guesses
+    p0_sigma = np.max(c_clean)
+    drop_idx = np.abs(c_clean - p0_sigma*0.36).argmin()
+    p0_l = r_clean[drop_idx] if drop_idx < len(r_clean) else r_clean[-1]/2
+    if p0_l == 0:
+        p0_l = 1.0
+
+    p0 = [p0_sigma, p0_l]
+
+    # Bounds
+    lower_bounds = [1e-6, 1e-6]
+    upper_bounds = [np.inf, np.inf]
+
+    # Use differential_evolution for global optimization (robust to local minima)
+    def objective(params):
+        """Sum of squared residuals."""
+        sigma_sq, length_scale = params
+        if sigma_sq <= 0 or length_scale <= 0:
+            return 1e10
+        pred = cov_func(r_clean, sigma_sq, length_scale)
+        return np.sum((c_clean - pred)**2)
+
+    # First try curve_fit (fast)
+    try:
+        popt_2d, pcov_2d = curve_fit(
+            cov_func,
+            r_clean,
+            c_clean,
+            p0=p0,
+            bounds=(lower_bounds, upper_bounds),
+            maxfev=5000
+        )
+        sigma_sq, length_scale = popt_2d
+    except (RuntimeError, ValueError):
+        # Fall back to differential evolution if curve_fit fails
+        print("  curve_fit failed, using differential_evolution...")
+        result = differential_evolution(
+            objective,
+            bounds=[(1e-6, p0_sigma*10), (1e-6, r_clean[-1])],
+            seed=42,
+            maxiter=1000,
+            atol=1e-8,
+            tol=1e-8
+        )
+        sigma_sq, length_scale = result.x
+        # Estimate covariance from Hessian approximation
+        pcov_2d = None
+
+    # Return in format [sigma_sq, nu, length_scale] for compatibility
+    popt = np.array([sigma_sq, nu, length_scale])
+
+    # Extend covariance matrix to 3x3 (nu has zero variance since it's fixed)
+    if pcov_2d is not None:
+        pcov = np.zeros((3, 3))
+        pcov[0, 0] = pcov_2d[0, 0]  # sigma_sq variance
+        pcov[0, 2] = pcov_2d[0, 1]  # sigma_sq, length_scale covariance
+        pcov[2, 0] = pcov_2d[1, 0]
+        pcov[2, 2] = pcov_2d[1, 1]  # length_scale variance
+    else:
+        pcov = None
 
     return popt, pcov
 
@@ -237,6 +537,15 @@ class MaternFieldSampler:
 
     def _matern_kernel(self, r):
         """Vectorized Matern function handling r=0 singularity"""
+        # Use analytical formulas for classical cases
+        if np.abs(self.nu - 0.5) < 1e-10:
+            return matern_covariance_half(r, self.sigma_sq, self.length_scale)
+        elif np.abs(self.nu - 1.5) < 1e-10:
+            return matern_covariance_three_half(r, self.sigma_sq, self.length_scale)
+        elif np.abs(self.nu - 2.5) < 1e-10:
+            return matern_covariance_five_half(r, self.sigma_sq, self.length_scale)
+
+        # General case with Bessel functions
         # 1. Prepare result array
         result = np.zeros_like(r, dtype=np.float64)
 
@@ -551,6 +860,15 @@ class PeriodicMaternFieldSampler:
 
     def _matern_kernel(self, r):
         """Vectorized Matérn kernel handling r=0 singularity."""
+        # Use analytical formulas for classical cases
+        if np.abs(self.nu - 0.5) < 1e-10:
+            return matern_covariance_half(r, self.sigma_sq, self.length_scale)
+        elif np.abs(self.nu - 1.5) < 1e-10:
+            return matern_covariance_three_half(r, self.sigma_sq, self.length_scale)
+        elif np.abs(self.nu - 2.5) < 1e-10:
+            return matern_covariance_five_half(r, self.sigma_sq, self.length_scale)
+
+        # General case with Bessel functions
         r = np.asarray(r)
         result = np.zeros_like(r, dtype=np.float64)
 
