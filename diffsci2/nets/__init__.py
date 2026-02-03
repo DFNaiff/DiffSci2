@@ -29,3 +29,11 @@ from .patched_conv import (
 )
 
 from .convit import ConVit, ConVitBlock, ConVitConfig
+
+from .enhanced_conditioning import (
+    FiLMLayer,
+    SpatialConditionEncoder,
+    ConditionAmplifier,
+    EnhancedConditioningWrapper,
+    wrap_model_with_enhanced_conditioning,
+)

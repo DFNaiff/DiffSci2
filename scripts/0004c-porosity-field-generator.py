@@ -1,17 +1,21 @@
 #!/usr/bin/env python
 """
-Multi-scale volume generator with porosity field conditioning (updated version).
+Multi-scale volume generator with different conditioning cases.
 
-Generates volumes at arbitrary scales (multiples of 128) using GP-sampled porosity
-fields as conditioning.
+Supports four generation cases:
+  Case 1 (default): Field porosity with post-trained model - post-trained checkpoint, GP-sampled field
+  Case 2: Null conditioning - original (scalar-trained) checkpoint, no conditioning
+  Case 3: Scalar porosity - original checkpoint, random scalar porosity from real data
+  Case 4: Field porosity with original model - original checkpoint, GP-sampled field
 
 Usage:
-    python porosity_generators_updated.py \
+    python 0004c-porosity-field-generator.py \
         --checkpoint /path/to/model.ckpt \
         --stone Estaillades \
         --output-dir ./generated_data/ \
-        --volume-sizes 256,512,1024,1152 \
-        --volume-samples 64,8,2,1 \
+        --volume-sizes 256,512,1024 \
+        --volume-samples 64,8,1 \
+        --generation-case 2 \
         --device cuda:0
 """
 
@@ -41,8 +45,12 @@ LATENT_TO_PIXEL_FACTOR = 8  # pixel_size = latent_size * 8
 MIN_LATENT_MULTIPLE = 16    # latent_size must be multiple of 16
 DILATION_FACTOR = 1         # Working in latent space (no dilation needed)
 
+# Base path for data
+BASEPATH = os.path.join(os.path.dirname(__file__), '..')
+NOTEBOOKPATH = os.path.join(BASEPATH, 'notebooks', 'exploratory', 'dfn')
+
 # Paths to GP analysis data (fitted in latent space with voxel_size=1.0)
-GPDATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'notebooks', 'exploratory', 'dfn', 'data', 'gpdata3c')
+GPDATA_DIR = os.path.join(NOTEBOOKPATH, 'data', 'gpdata3c')
 GPDATA_PATHS = {
     'Bentheimer': os.path.join(GPDATA_DIR, 'bentheimer', 'bentheimer_porosity_analysis.npz'),
     'Doddington': os.path.join(GPDATA_DIR, 'doddington', 'doddington_porosity_analysis.npz'),
@@ -50,18 +58,34 @@ GPDATA_PATHS = {
     'Ketton': os.path.join(GPDATA_DIR, 'ketton', 'ketton_porosity_analysis.npz'),
 }
 
+# Paths to original (scalar-trained) checkpoints for cases 2, 3, 4
+ORIGINAL_CHECKPOINTS = {
+    'Bentheimer': os.path.join(BASEPATH, 'savedmodels', 'pore', 'production', 'bentheimer_pcond.ckpt'),
+    'Doddington': os.path.join(BASEPATH, 'savedmodels', 'pore', 'production', 'doddington_pcond.ckpt'),
+    'Estaillades': os.path.join(BASEPATH, 'savedmodels', 'pore', 'production', 'estaillades_pcond.ckpt'),
+    'Ketton': os.path.join(BASEPATH, 'savedmodels', 'pore', 'production', 'ketton_pcond.ckpt'),
+}
+
+# Paths to real porosity volumes (for sampling scalar values in case 3)
+POROSITY_VOLUMES = {
+    'Bentheimer': os.path.join(NOTEBOOKPATH, 'data', 'gpdata2', 'bentheimer', 'Bentheimer_1000c_3p0035um_porosity_field_full.npy'),
+    'Doddington': os.path.join(NOTEBOOKPATH, 'data', 'gpdata2', 'doddington', 'Doddington_1000c_2p6929um_porosity_field_full.npy'),
+    'Estaillades': os.path.join(NOTEBOOKPATH, 'data', 'gpdata2', 'estaillades', 'Estaillades_1000c_3p31136um_porosity_field_full.npy'),
+    'Ketton': os.path.join(NOTEBOOKPATH, 'data', 'gpdata2', 'ketton', 'Ketton_1000c_3p00006um_porosity_field_full.npy'),
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Generate multi-scale volumes with porosity conditioning'
+        description='Generate multi-scale volumes with different conditioning cases'
     )
     parser.add_argument(
         '--checkpoint', type=str, required=True,
-        help='Path to model checkpoint'
+        help='Path to model checkpoint (post-trained for case 1, ignored for cases 2-4 which use original)'
     )
     parser.add_argument(
         '--stone', type=str, required=True, choices=AVAILABLE_STONES,
-        help='Stone type for GP parameters'
+        help='Stone type for GP parameters and original checkpoint'
     )
     parser.add_argument(
         '--output-dir', type=str, required=True,
@@ -72,8 +96,12 @@ def parse_args():
         help='Device for computation'
     )
     parser.add_argument(
+        '--generation-case', type=int, default=1, choices=[1, 2, 3, 4],
+        help='Generation case: 1=field+post-trained (default), 2=null, 3=scalar, 4=field+original'
+    )
+    parser.add_argument(
         '--coarse-n', type=int, default=32,
-        help='Coarse grid size for GP sampling (default: 16)'
+        help='Coarse grid size for GP sampling (default: 32)'
     )
     parser.add_argument(
         '--nsteps', type=int, default=21,
@@ -111,10 +139,10 @@ def parse_args():
         '--nsamples-per-field', type=int, default=None,
         help='Number of volume samples per porosity field (enables variance test mode)'
     )
-    # Enhanced conditioning options
+    # Enhanced conditioning options (for case 1 only)
     parser.add_argument(
         '--enhanced', action='store_true',
-        help='Use enhanced conditioning architecture (FiLM + multi-scale)'
+        help='Use enhanced conditioning architecture (FiLM + multi-scale) - case 1 only'
     )
     parser.add_argument(
         '--condition-embed-dim', type=int, default=64,
@@ -144,6 +172,22 @@ def load_gpdata(stone: str):
     """Load the GP analysis data for a stone type."""
     path = GPDATA_PATHS[stone]
     return np.load(path)
+
+
+def load_porosity_volume(stone: str):
+    """Load the real porosity volume for a stone type (used for scalar sampling)."""
+    path = POROSITY_VOLUMES[stone]
+    volume = np.load(path)
+    # Crop edges (as done in notebook)
+    volume = volume[128:-128, 128:-128, 128:-128]
+    return volume
+
+
+def sample_scalar_porosity(porosity_volume):
+    """Sample a random scalar porosity value from the real porosity volume."""
+    flat_volume = porosity_volume.flatten()
+    random_value = np.random.choice(flat_volume)
+    return np.array([random_value], dtype=np.float32)
 
 
 def create_porosity_sampler(stone: str, coarse_n: int = 16):
@@ -218,7 +262,7 @@ def sample_periodic_porosity_field(sampler, shape, coarse_n):
 
     # Create coordinate grid matching the shape
     axes = [np.linspace(0, s, s) for s in shape]
-    sampler.initialize_ficreate_periodic_porosity_samplereld_from_grid(*axes)
+    sampler.initialize_field_from_grid(*axes)
 
     # Sample the field
     field = sampler.sample_grid(1)[0]
@@ -304,9 +348,9 @@ def sample_new_porosity_field(sampler, pixel_size, coarse_n, periodic=False):
         return sample_porosity_field(sampler, [latent_size, latent_size, latent_size], coarse_n)
 
 
-def generate_volume_from_field(flowmodule, vaemodule, porosity_field, pixel_size, nsteps, device, guidance=1.0, periodic=False):
+def generate_volume_from_conditioning(flowmodule, vaemodule, y, pixel_size, nsteps, device, guidance=1.0, periodic=False):
     """
-    Generate a single volume conditioned on a given porosity field.
+    Generate a single volume with given conditioning.
 
     Parameters
     ----------
@@ -314,8 +358,8 @@ def generate_volume_from_field(flowmodule, vaemodule, porosity_field, pixel_size
         Flow model module.
     vaemodule : VAEModule
         Autoencoder module.
-    porosity_field : ndarray
-        Porosity field at latent resolution.
+    y : dict or None
+        Conditioning dict with 'porosity' key, or None for unconditional.
     pixel_size : int
         Target volume size in pixels (must be multiple of 128).
     nsteps : int
@@ -333,9 +377,6 @@ def generate_volume_from_field(flowmodule, vaemodule, porosity_field, pixel_size
         Generated volume of shape (pixel_size, pixel_size, pixel_size).
     """
     latent_size = pixel_size // LATENT_TO_PIXEL_FACTOR
-
-    porosity_tensor = torch.tensor(porosity_field, dtype=torch.float32)
-    y = {'porosity': porosity_tensor}
 
     use_chunk_decode = (pixel_size > 256)
     periodicity = [True, True, True] if periodic else [False, False, False]
@@ -369,11 +410,49 @@ def generate_volume_from_field(flowmodule, vaemodule, porosity_field, pixel_size
     return x
 
 
-def generate_volume(flowmodule, vaemodule, sampler, pixel_size, coarse_n, nsteps, device, guidance=1.0, periodic=False):
-    """Generate a single volume: sample a new porosity field and generate from it."""
+def generate_volume_case1(flowmodule, vaemodule, sampler, pixel_size, coarse_n, nsteps, device, guidance=1.0, periodic=False):
+    """Case 1: Field porosity with post-trained model - GP-sampled field."""
     porosity_field = sample_new_porosity_field(sampler, pixel_size, coarse_n, periodic)
-    x = generate_volume_from_field(flowmodule, vaemodule, porosity_field, pixel_size, nsteps, device, guidance, periodic)
+    porosity_tensor = torch.tensor(porosity_field, dtype=torch.float32)
+    y = {'porosity': porosity_tensor}
+    x = generate_volume_from_conditioning(flowmodule, vaemodule, y, pixel_size, nsteps, device, guidance, periodic)
     return x, porosity_field
+
+
+def generate_volume_case2(flowmodule, vaemodule, pixel_size, nsteps, device, guidance=1.0, periodic=False):
+    """Case 2: Null conditioning - no porosity input."""
+    y = None
+    x = generate_volume_from_conditioning(flowmodule, vaemodule, y, pixel_size, nsteps, device, guidance, periodic)
+    return x, None
+
+
+def generate_volume_case3(flowmodule, vaemodule, porosity_volume, pixel_size, nsteps, device, guidance=1.0, periodic=False):
+    """Case 3: Scalar porosity - random value from real data."""
+    scalar_porosity = sample_scalar_porosity(porosity_volume)
+    porosity_tensor = torch.tensor(scalar_porosity, dtype=torch.float32)
+    y = {'porosity': porosity_tensor}
+    x = generate_volume_from_conditioning(flowmodule, vaemodule, y, pixel_size, nsteps, device, guidance, periodic)
+    return x, scalar_porosity
+
+
+def generate_volume_case4(flowmodule, vaemodule, sampler, pixel_size, coarse_n, nsteps, device, guidance=1.0, periodic=False):
+    """Case 4: Field porosity with original model - GP-sampled field."""
+    porosity_field = sample_new_porosity_field(sampler, pixel_size, coarse_n, periodic)
+    porosity_tensor = torch.tensor(porosity_field, dtype=torch.float32)
+    y = {'porosity': porosity_tensor}
+    x = generate_volume_from_conditioning(flowmodule, vaemodule, y, pixel_size, nsteps, device, guidance, periodic)
+    return x, porosity_field
+
+
+def get_case_description(case):
+    """Return description string for a generation case."""
+    descriptions = {
+        1: "Field porosity with post-trained (field-trained) model",
+        2: "Null conditioning (y=None)",
+        3: "Scalar porosity (random from real data)",
+        4: "Field porosity with original (scalar-trained) model",
+    }
+    return descriptions.get(case, "Unknown case")
 
 
 def main():
@@ -393,13 +472,24 @@ def main():
     for size in volume_sizes:
         validate_volume_size(size)
 
+    # Determine which checkpoint to use based on case
+    generation_case = args.generation_case
+    if generation_case == 1:
+        # Use provided (post-trained) checkpoint for case 1
+        checkpoint_path = args.checkpoint
+        print(f"Using POST-TRAINED checkpoint for case {generation_case}: {checkpoint_path}")
+    else:
+        # Use original (scalar-trained) checkpoint for cases 2, 3, 4
+        checkpoint_path = ORIGINAL_CHECKPOINTS[args.stone]
+        print(f"Using ORIGINAL checkpoint for case {generation_case}: {checkpoint_path}")
+
     # Create output directories
     data_dir = os.path.join(args.output_dir, 'data')
     os.makedirs(data_dir, exist_ok=True)
 
     # Timing data
     timing = {
-        'checkpoint': args.checkpoint,
+        'checkpoint': checkpoint_path,
         'stone': args.stone,
         'device': args.device,
         'nsteps': args.nsteps,
@@ -407,39 +497,57 @@ def main():
         'guidance': args.guidance,
         'periodic': args.periodic,
         'binarize': not args.no_binarize,
+        'generation_case': generation_case,
+        'case_description': get_case_description(generation_case),
         'volume_sizes': volume_sizes,
         'volume_samples': volume_samples,
         'samples': []
     }
 
     # Load models
-    print(f"Loading models from {args.checkpoint}...")
+    print(f"\n=== Generation Case {generation_case}: {get_case_description(generation_case)} ===")
+    print(f"Loading models from {checkpoint_path}...")
     if args.periodic:
         print("  Using periodic (circular) convolutions")
-    if args.enhanced:
+    # Enhanced conditioning only makes sense for case 1
+    use_enhanced = args.enhanced and generation_case == 1
+    if use_enhanced:
         print("  Using enhanced conditioning (FiLM + multi-scale)")
+
     t_start = time.time()
     flowmodule, vaemodule = load_models(
-        args.checkpoint,
+        checkpoint_path,
         args.device,
         periodic=args.periodic,
-        enhanced=args.enhanced,
+        enhanced=use_enhanced,
         condition_embed_dim=args.condition_embed_dim
     )
     timing['model_load_time'] = time.time() - t_start
-    timing['enhanced'] = args.enhanced
+    timing['enhanced'] = use_enhanced
     print(f"  Model load time: {timing['model_load_time']:.2f}s")
 
-    # Create porosity sampler
-    print(f"Creating porosity sampler for {args.stone}...")
-    if args.periodic:
-        sampler, gpdata = create_periodic_porosity_sampler(args.stone, args.coarse_n)
-        print("  Using periodic porosity sampler")
-    else:
-        sampler, gpdata = create_porosity_sampler(args.stone, args.coarse_n)
-    print(f"  Mean logit: {gpdata['mean_logit']:.4f}")
-    print(f"  Matern params: sigma^2={gpdata['matern_sigma_sq']:.4f}, "
-          f"nu={gpdata['matern_nu']:.4f}, l={gpdata['matern_length_scale']:.4f}")
+    # Setup for each case
+    sampler = None
+    gpdata = None
+    porosity_volume = None
+
+    if generation_case in [1, 4]:
+        # Need porosity sampler
+        print(f"Creating porosity sampler for {args.stone}...")
+        if args.periodic:
+            sampler, gpdata = create_periodic_porosity_sampler(args.stone, args.coarse_n)
+            print("  Using periodic porosity sampler")
+        else:
+            sampler, gpdata = create_porosity_sampler(args.stone, args.coarse_n)
+        print(f"  Mean logit: {gpdata['mean_logit']:.4f}")
+        print(f"  Matern params: sigma^2={gpdata['matern_sigma_sq']:.4f}, "
+              f"nu={gpdata['matern_nu']:.4f}, l={gpdata['matern_length_scale']:.4f}")
+
+    if generation_case == 3:
+        # Need real porosity volume for scalar sampling
+        print(f"Loading real porosity volume for {args.stone}...")
+        porosity_volume = load_porosity_volume(args.stone)
+        print(f"  Volume shape: {porosity_volume.shape}, range: [{porosity_volume.min():.4f}, {porosity_volume.max():.4f}]")
 
     # Determine mode: variance test or standard
     variance_test = args.nfields is not None and args.nsamples_per_field is not None
@@ -451,7 +559,8 @@ def main():
 
         latent_size = pixel_size // LATENT_TO_PIXEL_FACTOR
 
-        if variance_test:
+        if variance_test and generation_case in [1, 4]:
+            # Variance test mode (only for field-based cases)
             nfields = args.nfields
             nsamples_per_field = args.nsamples_per_field
             total = nfields * nsamples_per_field
@@ -474,8 +583,10 @@ def main():
                     print(f"    Generating {pixel_size}_{s}_{f}...")
                     t_start = time.time()
 
-                    x = generate_volume_from_field(
-                        flowmodule, vaemodule, porosity_field,
+                    porosity_tensor = torch.tensor(porosity_field, dtype=torch.float32)
+                    y = {'porosity': porosity_tensor}
+                    x = generate_volume_from_conditioning(
+                        flowmodule, vaemodule, y,
                         pixel_size, args.nsteps, args.device, args.guidance,
                         periodic=args.periodic
                     )
@@ -491,18 +602,34 @@ def main():
                     print(f"      Saved to {output_path} ({elapsed:.2f}s, {'float' if args.no_binarize else 'bool'})")
 
         else:
-            # Standard mode: each sample gets its own field
+            # Standard mode: each sample independent
             print(f"\nGenerating {n_samples} x {pixel_size}^3 samples (latent: {latent_size}^3, guidance={args.guidance})...")
 
             for i in range(n_samples):
                 print(f"  Generating {pixel_size}_{i}...")
                 t_start = time.time()
 
-                x, porosity_field = generate_volume(
-                    flowmodule, vaemodule, sampler,
-                    pixel_size, args.coarse_n, args.nsteps, args.device, args.guidance,
-                    periodic=args.periodic
-                )
+                # Generate based on case
+                if generation_case == 1:
+                    x, porosity_data = generate_volume_case1(
+                        flowmodule, vaemodule, sampler, pixel_size, args.coarse_n, args.nsteps, args.device, args.guidance,
+                        periodic=args.periodic
+                    )
+                elif generation_case == 2:
+                    x, porosity_data = generate_volume_case2(
+                        flowmodule, vaemodule, pixel_size, args.nsteps, args.device, args.guidance,
+                        periodic=args.periodic
+                    )
+                elif generation_case == 3:
+                    x, porosity_data = generate_volume_case3(
+                        flowmodule, vaemodule, porosity_volume, pixel_size, args.nsteps, args.device, args.guidance,
+                        periodic=args.periodic
+                    )
+                else:  # case 4
+                    x, porosity_data = generate_volume_case4(
+                        flowmodule, vaemodule, sampler, pixel_size, args.coarse_n, args.nsteps, args.device, args.guidance,
+                        periodic=args.periodic
+                    )
 
                 elapsed = time.time() - t_start
                 timing['samples'].append({'size': pixel_size, 'index': i, 'time': elapsed})
@@ -514,9 +641,13 @@ def main():
                 np.save(output_path, x)
                 print(f"    Saved to {output_path} ({elapsed:.2f}s, {'float' if args.no_binarize else 'bool'})")
 
-                if args.save_porosity:
-                    porosity_path = os.path.join(data_dir, f'{pixel_size}_{i}.porosity.npy')
-                    np.save(porosity_path, porosity_field)
+                if args.save_porosity and porosity_data is not None:
+                    # Use different extension for scalar vs field porosity
+                    if generation_case == 3:
+                        porosity_path = os.path.join(data_dir, f'{pixel_size}_{i}.scalarporosity.npy')
+                    else:
+                        porosity_path = os.path.join(data_dir, f'{pixel_size}_{i}.porosity.npy')
+                    np.save(porosity_path, porosity_data)
                     print(f"    Saved porosity to {porosity_path}")
 
     # Compute summary statistics per size

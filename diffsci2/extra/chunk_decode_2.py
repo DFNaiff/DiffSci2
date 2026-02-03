@@ -215,7 +215,188 @@ class ChunkConfig:
     spans_per_axis: List[List[Tuple[int, int]]]
     caps: Tuple[Optional[int], ...]     # Max output size per axis (or None)
     periodic: Tuple[bool, ...]          # Periodicity per axis
-    debug: int                          # 0=none, 1=per-stage, 2=per-tile
+    debug: int                          # 0=none, 1=per-stage, 2=per-tile, 3=memory tracking
+
+
+# ============================================================================
+# DEBUG / MEMORY TRACKING UTILITIES
+# ============================================================================
+
+def _format_bytes(num_bytes: int) -> str:
+    """Format bytes into human-readable string."""
+    if num_bytes < 0:
+        return f"-{_format_bytes(-num_bytes)}"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f} PB"
+
+
+def _get_tensor_memory(tensor: torch.Tensor) -> int:
+    """Get memory footprint of a tensor in bytes."""
+    return tensor.element_size() * tensor.numel()
+
+
+class MemoryTracker:
+    """
+    Tracks GPU and CPU memory usage throughout chunked decoding.
+
+    Usage:
+        tracker = MemoryTracker(device, enabled=debug>=3)
+        tracker.checkpoint("before allocation")
+        # ... do something ...
+        tracker.checkpoint("after allocation")
+        tracker.print_summary()
+    """
+
+    def __init__(self, device: torch.device, enabled: bool = True):
+        self.device = device
+        self.enabled = enabled
+        self.checkpoints: List[Tuple[str, dict]] = []
+        self.peak_gpu_allocated = 0
+        self.peak_gpu_reserved = 0
+
+        if self.enabled and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def _get_gpu_stats(self) -> dict:
+        """Get current GPU memory statistics."""
+        if not torch.cuda.is_available():
+            return {"allocated": 0, "reserved": 0, "free": 0}
+
+        allocated = torch.cuda.memory_allocated(self.device)
+        reserved = torch.cuda.memory_reserved(self.device)
+
+        # Get total GPU memory
+        props = torch.cuda.get_device_properties(self.device)
+        total = props.total_memory
+        free = total - reserved
+
+        return {
+            "allocated": allocated,
+            "reserved": reserved,
+            "free": free,
+            "total": total,
+        }
+
+    def _get_cpu_stats(self) -> dict:
+        """Get current CPU/process memory statistics."""
+        try:
+            import psutil
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            return {
+                "rss": mem_info.rss,  # Resident Set Size
+                "vms": mem_info.vms,  # Virtual Memory Size
+            }
+        except ImportError:
+            return {"rss": 0, "vms": 0}
+
+    def checkpoint(self, label: str, tensor: Optional[torch.Tensor] = None):
+        """Record a memory checkpoint with optional tensor size annotation."""
+        if not self.enabled:
+            return
+
+        gpu_stats = self._get_gpu_stats()
+        cpu_stats = self._get_cpu_stats()
+
+        # Track peaks
+        self.peak_gpu_allocated = max(self.peak_gpu_allocated, gpu_stats["allocated"])
+        self.peak_gpu_reserved = max(self.peak_gpu_reserved, gpu_stats["reserved"])
+
+        tensor_info = None
+        if tensor is not None:
+            tensor_info = {
+                "shape": tuple(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+                "bytes": _get_tensor_memory(tensor),
+            }
+
+        self.checkpoints.append((label, {
+            "gpu": gpu_stats,
+            "cpu": cpu_stats,
+            "tensor": tensor_info,
+        }))
+
+    def print_checkpoint(self, label: str, tensor: Optional[torch.Tensor] = None):
+        """Record checkpoint and immediately print it."""
+        if not self.enabled:
+            return
+
+        self.checkpoint(label, tensor)
+
+        # Get the checkpoint we just recorded
+        _, stats = self.checkpoints[-1]
+        gpu = stats["gpu"]
+        cpu = stats["cpu"]
+        tensor_info = stats["tensor"]
+
+        # Calculate delta from previous checkpoint
+        delta_str = ""
+        if len(self.checkpoints) > 1:
+            _, prev_stats = self.checkpoints[-2]
+            delta_alloc = gpu["allocated"] - prev_stats["gpu"]["allocated"]
+            delta_rss = cpu["rss"] - prev_stats["cpu"]["rss"]
+            if delta_alloc != 0 or delta_rss != 0:
+                delta_str = f" (Δ GPU: {_format_bytes(delta_alloc):>10}, Δ CPU: {_format_bytes(delta_rss):>10})"
+
+        # Format tensor info
+        tensor_str = ""
+        if tensor_info:
+            tensor_str = f" | Tensor: {tensor_info['shape']} {tensor_info['dtype']} = {_format_bytes(tensor_info['bytes'])}"
+
+        print(f"      [MEM] {label:40s} | GPU: {_format_bytes(gpu['allocated']):>10} / {_format_bytes(gpu['reserved']):>10} | CPU RSS: {_format_bytes(cpu['rss']):>10}{delta_str}{tensor_str}")
+
+    def print_stage_summary(self, stage: int):
+        """Print memory summary for a stage."""
+        if not self.enabled:
+            return
+
+        gpu_stats = self._get_gpu_stats()
+
+        if torch.cuda.is_available():
+            peak_alloc = torch.cuda.max_memory_allocated(self.device)
+            peak_reserved = torch.cuda.max_memory_reserved(self.device)
+        else:
+            peak_alloc = self.peak_gpu_allocated
+            peak_reserved = self.peak_gpu_reserved
+
+        print(f"      ╔{'═'*70}╗")
+        print(f"      ║ STAGE {stage} MEMORY SUMMARY{' '*47}║")
+        print(f"      ╠{'═'*70}╣")
+        print(f"      ║ GPU Allocated: {_format_bytes(gpu_stats['allocated']):>12} │ Peak: {_format_bytes(peak_alloc):>12}{' '*24}║")
+        print(f"      ║ GPU Reserved:  {_format_bytes(gpu_stats['reserved']):>12} │ Peak: {_format_bytes(peak_reserved):>12}{' '*24}║")
+        print(f"      ╚{'═'*70}╝")
+
+    def print_final_summary(self):
+        """Print final memory summary."""
+        if not self.enabled:
+            return
+
+        gpu_stats = self._get_gpu_stats()
+        cpu_stats = self._get_cpu_stats()
+
+        if torch.cuda.is_available():
+            peak_alloc = torch.cuda.max_memory_allocated(self.device)
+            peak_reserved = torch.cuda.max_memory_reserved(self.device)
+        else:
+            peak_alloc = self.peak_gpu_allocated
+            peak_reserved = self.peak_gpu_reserved
+
+        print()
+        print(f"  ╔{'═'*76}╗")
+        print(f"  ║ FINAL MEMORY SUMMARY{' '*55}║")
+        print(f"  ╠{'═'*76}╣")
+        print(f"  ║ GPU Current Allocated: {_format_bytes(gpu_stats['allocated']):>12}{' '*39}║")
+        print(f"  ║ GPU Peak Allocated:    {_format_bytes(peak_alloc):>12}{' '*39}║")
+        print(f"  ║ GPU Reserved:          {_format_bytes(gpu_stats['reserved']):>12}{' '*39}║")
+        print(f"  ║ GPU Peak Reserved:     {_format_bytes(peak_reserved):>12}{' '*39}║")
+        print(f"  ╠{'─'*76}╣")
+        print(f"  ║ CPU RSS:               {_format_bytes(cpu_stats['rss']):>12}{' '*39}║")
+        print(f"  ║ CPU VMS:               {_format_bytes(cpu_stats['vms']):>12}{' '*39}║")
+        print(f"  ╚{'═'*76}╝")
 
 
 @dataclass
@@ -919,8 +1100,10 @@ class ParallelTileProcessor:
             device_counts = [0] * self.num_devices
             for i in range(len(tile_jobs)):
                 device_counts[i % self.num_devices] += 1
-            print(f"    Dispatching {len(tile_jobs)} tiles in {num_batches} batches: "
-                  f"{device_counts} tiles per device")
+            print(f"    ┌─ Parallel batch dispatch ─────────────────────────────────")
+            print(f"    │ Total tiles: {len(tile_jobs)}, Batches: {num_batches}")
+            print(f"    │ Tiles per device: {device_counts}")
+            print(f"    └{'─'*55}")
 
         for batch_idx in range(num_batches):
             batch_start = batch_idx * batch_size
@@ -956,7 +1139,7 @@ class ParallelTileProcessor:
             torch.cuda.empty_cache()
 
         if debug >= 2:
-            print(f"    Completed {len(tile_jobs)} tiles in parallel")
+            print(f"    ✓ Completed {len(tile_jobs)} tiles in parallel")
 
 
 def create_stage_runners_for_devices(
@@ -1034,13 +1217,29 @@ def setup_chunk_config(
         spans_per_axis.append(spans)
 
     if debug >= 1:
-        print(f"Spatial shape: {spatial_shape} ({ndim}D)")
-        print(f"radii_latent = {radii_latent}")
-        print(f"delta_r_lat = {delta_r_lat}")
-        print(f"scales_after = {scales_after}")
-        print(f"Spans per axis: {spans_per_axis}")
-        print(f"Periodicity: {periodic}")
-        print(f"Caps (dest units): {caps}")
+        total_tiles = 1
+        for spans in spans_per_axis:
+            total_tiles *= len(spans)
+
+        print()
+        print(f"  ┌{'─'*60}┐")
+        print(f"  │ CHUNKED DECODE CONFIGURATION{' '*30}│")
+        print(f"  ├{'─'*60}┤")
+        print(f"  │ Spatial shape:   {str(spatial_shape):20s} ({ndim}D){' '*14}│")
+        print(f"  │ Chunk (latent):  {str(chunk):40s}│")
+        print(f"  │ Num stages:      {num_stages:<40d}│")
+        print(f"  │ Total tiles:     {total_tiles:<40d}│")
+        print(f"  │ Periodicity:     {str(periodic):40s}│")
+        print(f"  │ Output caps:     {str(caps):40s}│")
+        print(f"  ├{'─'*60}┤")
+        print(f"  │ Radii (latent):  {str(radii_latent):40s}│")
+        print(f"  │ Delta radii:     {str(delta_r_lat):40s}│")
+        print(f"  │ Scales after:    {str(scales_after):40s}│")
+        print(f"  └{'─'*60}┘")
+        if debug >= 2:
+            print(f"  Tile spans per axis:")
+            for i, spans in enumerate(spans_per_axis):
+                print(f"    Axis {i}: {spans}")
 
     return ChunkConfig(
         device=device,
@@ -1092,7 +1291,11 @@ def chunk_decode_strategy_b(
         chunk_latent: Tile size in latent units (int or tuple per axis)
         device: Compute device for stage tiles (default: decoder's device)
         time: Optional time embedding tensor
-        debug: Debug verbosity level (0=none, 1=per-stage, 2=per-tile)
+        debug: Debug verbosity level:
+               0 = no output
+               1 = per-stage summaries
+               2 = per-tile details with nice formatting
+               3 = full memory tracking (GPU allocated/reserved, CPU RSS, deltas)
         max_stage_out_chunk: Cap per-stage output size (int or tuple per axis)
         periodicity: Enable periodic BCs (bool or tuple per axis)
         use_cached_norms: If True, use first-tile norm caching to eliminate
@@ -1143,12 +1346,17 @@ def chunk_decode_strategy_b(
     was_training = decoder.training
     decoder.eval()
 
+    # Initialize memory tracker for debug level 3
+    mem_tracker = MemoryTracker(cfg.device, enabled=(cfg.debug >= 3))
+    if cfg.debug >= 3:
+        mem_tracker.print_checkpoint("Initial state")
+
     # Determine number of stages to run
     num_stages_to_run = cfg.num_stages
     if max_stages is not None:
         num_stages_to_run = min(max_stages, cfg.num_stages)
         if cfg.debug >= 1:
-            print(f"Limiting to {num_stages_to_run} stages (out of {cfg.num_stages})")
+            print(f"  Limiting to {num_stages_to_run} stages (out of {cfg.num_stages})")
 
     # Process each stage
     for s in range(num_stages_to_run):
@@ -1158,9 +1366,17 @@ def chunk_decode_strategy_b(
         up_factor = dest_scale // src_scale
 
         if cfg.debug >= 1:
-            print(f"\n=== Stage {s} ===")
-            print(f"  stage_local_lat={stage_local_lat}, src_scale={src_scale}, "
-                  f"dest_scale={dest_scale}, up_factor={up_factor}")
+            print()
+            print(f"  ╔{'═'*60}╗")
+            print(f"  ║ STAGE {s}/{num_stages_to_run-1}{' '*50}║")
+            print(f"  ╠{'═'*60}╣")
+            print(f"  ║ Local RF (latent): {stage_local_lat:<38d}║")
+            print(f"  ║ Source scale:      {src_scale:<38d}║")
+            print(f"  ║ Dest scale:        {dest_scale:<38d}║")
+            print(f"  ║ Upsample factor:   {up_factor:<38d}║")
+            print(f"  ╚{'═'*60}╝")
+        if cfg.debug >= 3:
+            mem_tracker.print_checkpoint(f"Stage {s} start")
 
         dest_buf = stage_bufs[s]
         dest_created = dest_buf is not None
@@ -1172,7 +1388,7 @@ def chunk_decode_strategy_b(
             set_all_norms_mode(decoder, "cache")
             first_tile_of_stage = True
             if cfg.debug >= 1:
-                print(f"  [CachedNorms] Stage {s}: ready to cache from first tile")
+                print(f"    [CachedNorms] Ready to cache from first tile")
 
         # Iterate over all center tiles
         tile_count = 0
@@ -1190,10 +1406,9 @@ def chunk_decode_strategy_b(
                 )
 
                 if cfg.debug >= 2:
-                    print(f"  [Tile {tile_count}, sub {sub_idx}] "
-                          f"center={sub_tile.ranges}, "
-                          f"read_lat={read_win.lat_ranges}, "
-                          f"read_src={read_win.src_ranges}")
+                    print(f"    ┌─ Tile {tile_count}.{sub_idx} ─────────────────────────────────────────")
+                    print(f"    │ Center (latent): {sub_tile.ranges}")
+                    print(f"    │ Read window:     lat={read_win.lat_ranges}  src={read_win.src_ranges}")
 
                 # Fetch input from source
                 if s == 0:
@@ -1213,16 +1428,21 @@ def chunk_decode_strategy_b(
                         read_win.src_ranges, cfg.device, cfg.dtype
                     )
 
+                if cfg.debug >= 3:
+                    mem_tracker.print_checkpoint(f"Tile {tile_count}.{sub_idx}: input loaded", x_in)
+
                 # Run stage
                 y_tile = stage_runners[s](x_in)
+
+                if cfg.debug >= 3:
+                    mem_tracker.print_checkpoint(f"Tile {tile_count}.{sub_idx}: stage computed", y_tile)
 
                 # For cached norms: after first tile, switch to use_cached mode
                 if use_cached_norms and first_tile_of_stage:
                     set_all_norms_mode(decoder, "use_cached")
                     first_tile_of_stage = False
                     if cfg.debug >= 1:
-                        print(f"  [CachedNorms] Stage {s}: cached stats from first tile, "
-                              "using cached for remaining tiles")
+                        print(f"    [CachedNorms] Stats cached, using for remaining tiles")
 
                 # Allocate destination buffer if needed
                 if not dest_created:
@@ -1236,8 +1456,12 @@ def chunk_decode_strategy_b(
                     )
                     dest_buf = stage_bufs[s]
                     dest_created = True
+                    buf_shape = (B_, C_out, *out_spatial)
+                    buf_bytes = B_ * C_out * int(torch.tensor(out_spatial).prod().item()) * y_tile.element_size()
                     if cfg.debug >= 1:
-                        print(f"  Allocated dest buffer: {(B_, C_out, *out_spatial)}")
+                        print(f"    [Buffer] Allocated CPU buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
+                    if cfg.debug >= 3:
+                        mem_tracker.print_checkpoint(f"Stage {s} buffer allocated", dest_buf.tensor)
 
                 # Compute crop coordinates
                 crop = compute_crop_spec(
@@ -1246,9 +1470,9 @@ def chunk_decode_strategy_b(
                 )
 
                 if cfg.debug >= 2:
-                    print(f"    -> y_tile shape: {tuple(y_tile.shape)}, "
-                          f"crop_slices: {crop.tile_slices}, "
-                          f"dest_ranges: {crop.dest_ranges}")
+                    print(f"    │ Output shape:    {tuple(y_tile.shape)}")
+                    print(f"    │ Crop slices:     {crop.tile_slices}")
+                    print(f"    │ Dest ranges:     {crop.dest_ranges}")
 
                 # Crop valid center
                 slices = [slice(None), slice(None)]  # B, C
@@ -1259,7 +1483,10 @@ def chunk_decode_strategy_b(
                 dest_buf.write_block(crop.dest_ranges, y_center)
 
                 if cfg.debug >= 2:
-                    print(f"    -> wrote y_center shape: {tuple(y_center.shape)}")
+                    print(f"    │ Written:         {tuple(y_center.shape)}")
+                    print(f"    └{'─'*55}")
+                if cfg.debug >= 3:
+                    mem_tracker.print_checkpoint(f"Tile {tile_count}.{sub_idx}: written to buffer")
 
                 # Free GPU tensor references (actual memory freed lazily by CUDA)
                 del y_tile, y_center, x_in
@@ -1272,7 +1499,7 @@ def chunk_decode_strategy_b(
             tile_count += 1
 
         if cfg.debug >= 1:
-            print(f"  Stage {s} complete: processed {tile_count} tiles")
+            print(f"    ✓ Stage {s} complete: processed {tile_count} tiles")
 
         # Synchronize to ensure all async transfers complete before next stage reads
         if torch.cuda.is_available():
@@ -1281,6 +1508,10 @@ def chunk_decode_strategy_b(
         # Clean up GPU memory once per stage (unless already doing aggressive cleaning)
         if not aggressive_cleaning and torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        if cfg.debug >= 3:
+            mem_tracker.print_checkpoint(f"Stage {s} cleanup complete")
+            mem_tracker.print_stage_summary(s)
 
         # Update for next stage
         prev_scale = dest_scale
@@ -1291,6 +1522,11 @@ def chunk_decode_strategy_b(
     if use_cached_norms:
         set_all_norms_mode(decoder, "normal")
         clear_all_norm_caches(decoder)
+
+    if cfg.debug >= 3:
+        mem_tracker.print_final_summary()
+    if cfg.debug >= 1:
+        print(f"\n  ✓ Decode complete. Output shape: {tuple(prev_buf.tensor.shape)}")
 
     # Return last processed stage (may not be final if max_stages was set)
     return prev_buf.tensor
@@ -1371,7 +1607,11 @@ def chunk_decode_parallel(
         chunk_latent: Tile size in latent units
         devices: List of CUDA devices (e.g., ["cuda:0", "cuda:1", "cuda:2", "cuda:3"])
         time: Optional time embedding tensor
-        debug: Debug verbosity level (0=none, 1=per-stage, 2=per-tile)
+        debug: Debug verbosity level:
+               0 = no output
+               1 = per-stage summaries
+               2 = per-tile details with nice formatting
+               3 = full memory tracking (GPU allocated/reserved, CPU RSS, deltas)
         max_stage_out_chunk: Cap per-stage output size
         periodicity: Enable periodic BCs
         use_cached_norms: If True, use first-tile norm caching (requires cached norm layers)
@@ -1412,7 +1652,11 @@ def chunk_decode_parallel(
         )
 
     if debug >= 1:
-        print(f"Parallel decode on {num_devices} devices: {devices}")
+        print()
+        print(f"  ┌{'─'*60}┐")
+        print(f"  │ PARALLEL DECODE: {num_devices} devices{' '*35}│")
+        print(f"  │ Devices: {str([str(d) for d in devices])[:48]:48s}│")
+        print(f"  └{'─'*60}┘")
 
     # Check cached norms
     if use_cached_norms and not _has_cached_norms(decoder):
@@ -1429,7 +1673,7 @@ def chunk_decode_parallel(
 
     # Get or create decoder replicas (cached to avoid expensive deep-copy)
     if debug >= 1:
-        print("Getting decoder replicas...")
+        print("  Getting decoder replicas...")
     decoders = get_cached_decoder_replicas(decoder, devices, debug=debug)
 
     # Create stage runners for each device
@@ -1447,12 +1691,17 @@ def chunk_decode_parallel(
     prev_scale = 1
     prev_buf: Optional[CPUStageBuffer] = None
 
+    # Initialize memory tracker for debug level 3
+    mem_tracker = MemoryTracker(devices[0], enabled=(debug >= 3))
+    if debug >= 3:
+        mem_tracker.print_checkpoint("Initial state (parallel)")
+
     # Determine number of stages to run
     num_stages_to_run = cfg.num_stages
     if max_stages is not None:
         num_stages_to_run = min(max_stages, cfg.num_stages)
         if debug >= 1:
-            print(f"Limiting to {num_stages_to_run} stages (out of {cfg.num_stages})")
+            print(f"  Limiting to {num_stages_to_run} stages (out of {cfg.num_stages})")
 
     # Process each stage
     for s in range(num_stages_to_run):
@@ -1462,9 +1711,17 @@ def chunk_decode_parallel(
         up_factor = dest_scale // src_scale
 
         if debug >= 1:
-            print(f"\n=== Stage {s} ===")
-            print(f"  stage_local_lat={stage_local_lat}, src_scale={src_scale}, "
-                  f"dest_scale={dest_scale}, up_factor={up_factor}")
+            print()
+            print(f"  ╔{'═'*60}╗")
+            print(f"  ║ STAGE {s}/{num_stages_to_run-1} (PARALLEL){' '*42}║")
+            print(f"  ╠{'═'*60}╣")
+            print(f"  ║ Local RF (latent): {stage_local_lat:<38d}║")
+            print(f"  ║ Source scale:      {src_scale:<38d}║")
+            print(f"  ║ Dest scale:        {dest_scale:<38d}║")
+            print(f"  ║ Upsample factor:   {up_factor:<38d}║")
+            print(f"  ╚{'═'*60}╝")
+        if debug >= 3:
+            mem_tracker.print_checkpoint(f"Stage {s} start")
 
         dest_buf = stage_bufs[s]
         dest_created = dest_buf is not None
@@ -1476,7 +1733,7 @@ def chunk_decode_parallel(
                 set_all_norms_mode(dec, "cache")
             first_tile_of_stage = True
             if debug >= 1:
-                print(f"  [CachedNorms] Stage {s}: ready to cache from first tile")
+                print(f"    [CachedNorms] Ready to cache from first tile")
 
         # Collect all tiles for this stage
         all_tiles = list(iterate_nd_tiles(cfg.spans_per_axis))
@@ -1528,8 +1785,12 @@ def chunk_decode_parallel(
                     )
                     dest_buf = stage_bufs[s]
                     dest_created = True
+                    buf_shape = (B_, C_out, *out_spatial)
+                    buf_bytes = B_ * C_out * int(torch.tensor(out_spatial).prod().item()) * y_tile.element_size()
                     if debug >= 1:
-                        print(f"  Allocated dest buffer: {(B_, C_out, *out_spatial)}")
+                        print(f"    [Buffer] Allocated CPU buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
+                    if debug >= 3:
+                        mem_tracker.print_checkpoint(f"Stage {s} buffer allocated", dest_buf.tensor)
 
                 # Crop and write
                 crop = compute_crop_spec(
@@ -1551,7 +1812,7 @@ def chunk_decode_parallel(
                 sync_cached_norms_across_devices(decoders, source_idx=0)
 
                 if debug >= 1:
-                    print(f"  [CachedNorms] Stage {s}: cached stats synced to all {num_devices} devices")
+                    print(f"    [CachedNorms] Stats synced to all {num_devices} devices")
 
                 first_tile_of_stage = False
 
@@ -1570,10 +1831,10 @@ def chunk_decode_parallel(
                 )
 
                 if debug >= 2:
-                    print(f"  [Tile {tile_idx}, sub {sub_idx}] "
-                          f"center={sub_tile.ranges}, "
-                          f"read_lat={read_win.lat_ranges}, "
-                          f"read_src={read_win.src_ranges}")
+                    print(f"    ┌─ Tile {tile_idx}.{sub_idx} (parallel) ───────────────────────────────")
+                    print(f"    │ Center (latent): {sub_tile.ranges}")
+                    print(f"    │ Read window:     lat={read_win.lat_ranges}  src={read_win.src_ranges}")
+                    print(f"    └{'─'*55}")
 
                 # Fetch input (to CPU)
                 if s == 0:
@@ -1606,10 +1867,14 @@ def chunk_decode_parallel(
                     )
                     dest_buf = stage_bufs[s]
                     dest_created = True
+                    buf_shape = (B_, C_out, *out_spatial)
+                    buf_bytes = B_ * C_out * int(torch.tensor(out_spatial).prod().item()) * y_probe.element_size()
                     del x_probe, y_probe
                     torch.cuda.empty_cache()
                     if debug >= 1:
-                        print(f"  Allocated dest buffer: {(B_, C_out, *out_spatial)}")
+                        print(f"    [Buffer] Allocated CPU buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
+                    if debug >= 3:
+                        mem_tracker.print_checkpoint(f"Stage {s} buffer allocated", dest_buf.tensor)
 
                 crop = compute_crop_spec(
                     sub_tile, read_win, src_scale, dest_scale, up_factor,
@@ -1626,7 +1891,7 @@ def chunk_decode_parallel(
             tile_idx += 1
 
         if debug >= 1:
-            print(f"  Stage {s} complete: processed {tile_idx} tiles")
+            print(f"    ✓ Stage {s} complete: processed {tile_idx} tiles")
 
         # Synchronize all devices to ensure async transfers complete before next stage reads
         if torch.cuda.is_available():
@@ -1637,6 +1902,10 @@ def chunk_decode_parallel(
         if not aggressive_cleaning and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        if debug >= 3:
+            mem_tracker.print_checkpoint(f"Stage {s} cleanup complete")
+            mem_tracker.print_stage_summary(s)
+
         # Update for next stage
         prev_scale = dest_scale
         prev_buf = dest_buf
@@ -1646,6 +1915,11 @@ def chunk_decode_parallel(
         for dec in decoders:
             set_all_norms_mode(dec, "normal")
             clear_all_norm_caches(dec)
+
+    if debug >= 3:
+        mem_tracker.print_final_summary()
+    if debug >= 1:
+        print(f"\n  ✓ Parallel decode complete. Output shape: {tuple(prev_buf.tensor.shape)}")
 
     # Return last processed stage (may not be final if max_stages was set)
     return prev_buf.tensor
@@ -1739,12 +2013,12 @@ def chunk_decode_with_cached_norms(
     # Step 1: Convert norm layers to cached versions (one-time)
     if convert_norms:
         if debug >= 1:
-            print("Converting norm layers to cached versions...")
+            print("  Converting norm layers to cached versions...")
         prepare_decoder_for_cached_decode(decoder, inplace=True)
 
     # Step 2: Run chunked decode with per-stage first-tile caching
     if debug >= 1:
-        print("Running chunked decode with first-tile norm caching...")
+        print("  Running chunked decode with first-tile norm caching...")
 
     result = chunk_decode_strategy_b(
         decoder, z_latent, chunk_latent,
@@ -1881,3 +2155,29 @@ if __name__ == "__main__":
     print("      devices=['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3'],")
     print("      use_cached_norms=True")
     print("  )")
+    print()
+    print("=" * 70)
+    print("DEBUG LEVELS:")
+    print("=" * 70)
+    print()
+    print("  debug=0: No output (default)")
+    print("  debug=1: Per-stage summaries")
+    print("           - Configuration overview")
+    print("           - Stage parameters (RF, scale, upsample factor)")
+    print("           - Buffer allocations")
+    print("           - Stage completion status")
+    print()
+    print("  debug=2: Per-tile details (nice box formatting)")
+    print("           - Tile coordinates and read windows")
+    print("           - Output shapes and crop specifications")
+    print("           - Parallel batch dispatch info")
+    print()
+    print("  debug=3: Full memory tracking")
+    print("           - GPU allocated/reserved memory at each step")
+    print("           - CPU RSS memory usage")
+    print("           - Memory deltas between operations")
+    print("           - Per-stage and final memory summaries")
+    print("           - Tensor size annotations")
+    print()
+    print("  Example:")
+    print("  result = chunk_decode_3d(decoder, z, chunk, debug=3)")
