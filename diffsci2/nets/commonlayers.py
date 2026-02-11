@@ -10,6 +10,33 @@ from .attention import (NDimensionalAttention,  # noqa: F401
 from . import normedlayers
 
 
+def _chunked_upsample(upsampler, x, threshold_ratio=0.8):
+    """
+    Upsample with automatic chunking along the channel dimension to avoid
+    PyTorch's INT_MAX element limit in upsample_nearest{2,3}d.
+
+    Only activates chunking when the output tensor would exceed
+    threshold_ratio * INT_MAX elements; otherwise delegates directly.
+    """
+    INT_MAX = 2**31 - 1
+    threshold = threshold_ratio * INT_MAX
+
+    ndim_spatial = x.ndim - 2
+    scale = upsampler.scale_factor
+    out_numel = x.numel() * (scale ** ndim_spatial)
+
+    if out_numel <= threshold:
+        return upsampler(x)
+
+    C = x.shape[1]
+    per_channel_elements = out_numel / C
+    max_channels_per_chunk = max(1, int(threshold // per_channel_elements))
+    num_chunks = -(-C // max_channels_per_chunk)  # ceiling division
+
+    parts = x.chunk(num_chunks, dim=1)
+    return torch.cat([upsampler(p) for p in parts], dim=1)
+
+
 class SwiGLU(torch.nn.Module):
     def __init__(self, in_dims: int,
                  out_dims: int):
@@ -142,7 +169,7 @@ class UpSampler(torch.nn.Module):
 
         # x : (B, C_in, H, W)
         # returns : (B, C_out, H*2, W*2)
-        return self.conv(self.upsampler(x))
+        return self.conv(_chunked_upsample(self.upsampler, x))
 
     def get_convolution_function(self):
         if self.convolution_type == "default":
