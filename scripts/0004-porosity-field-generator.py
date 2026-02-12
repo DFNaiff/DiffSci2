@@ -218,7 +218,7 @@ def sample_periodic_porosity_field(sampler, shape, coarse_n):
 
     # Create coordinate grid matching the shape
     axes = [np.linspace(0, s, s) for s in shape]
-    sampler.initialize_ficreate_periodic_porosity_samplereld_from_grid(*axes)
+    sampler.initialize_field_from_grid(*axes)
 
     # Sample the field
     field = sampler.sample_grid(1)[0]
