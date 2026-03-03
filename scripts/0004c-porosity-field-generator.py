@@ -2,11 +2,14 @@
 """
 Multi-scale volume generator with different conditioning cases.
 
-Supports four generation cases:
+Supports seven generation cases:
   Case 1 (default): Field porosity with post-trained model - post-trained checkpoint, GP-sampled field
   Case 2: Null conditioning - original (scalar-trained) checkpoint, no conditioning
   Case 3: Scalar porosity - original checkpoint, random scalar porosity from real data
-  Case 4: Field porosity with original model - original checkpoint, GP-sampled field
+  Case 4: Field porosity with original model - original checkpoint, GP-sampled field (gpdata3c)
+  Case 5: Field porosity with 129-trained model - 129 checkpoint, GP field from gpdata4-129
+  Case 6: Field porosity with original model - original checkpoint, GP field from gpdata4-129
+  Case 7: Unconditional with provided checkpoint - provided checkpoint, no conditioning
 
 Usage:
     python 0004c-porosity-field-generator.py \
@@ -32,7 +35,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'notebooks', 'exploratory', 'dfn', 'aux'))
 
 import diffsci2.models
-from model_loaders import load_flow_model, load_autoencoder
+import diffsci2.nets
+from model_loaders import load_flow_model, load_model_from_module, load_autoencoder
 from diffsci2.extra import chunk_decode_2, punetg_converters
 from diffsci2.extra.matern_gaussian_process import MaternFieldSampler, PeriodicMaternFieldSampler
 from diffsci2.nets.enhanced_conditioning import wrap_model_with_enhanced_conditioning
@@ -58,6 +62,15 @@ GPDATA_PATHS = {
     'Ketton': os.path.join(GPDATA_DIR, 'ketton', 'ketton_porosity_analysis.npz'),
 }
 
+# Paths to GP analysis data for 129 models (fitted on 129-resolution data)
+GPDATA_129_DIR = os.path.join(NOTEBOOKPATH, 'data', 'gpdata4-129')
+GPDATA_129_PATHS = {
+    'Bentheimer': os.path.join(GPDATA_129_DIR, 'bentheimer', 'bentheimer_porosity_analysis.npz'),
+    'Doddington': os.path.join(GPDATA_129_DIR, 'doddington', 'doddington_porosity_analysis.npz'),
+    'Estaillades': os.path.join(GPDATA_129_DIR, 'estaillades', 'estaillades_porosity_analysis.npz'),
+    'Ketton': os.path.join(GPDATA_129_DIR, 'ketton', 'ketton_porosity_analysis.npz'),
+}
+
 # Paths to original (scalar-trained) checkpoints for cases 2, 3, 4
 ORIGINAL_CHECKPOINTS = {
     'Bentheimer': os.path.join(BASEPATH, 'savedmodels', 'pore', 'production', 'bentheimer_pcond.ckpt'),
@@ -74,14 +87,22 @@ POROSITY_VOLUMES = {
     'Ketton': os.path.join(NOTEBOOKPATH, 'data', 'gpdata2', 'ketton', 'Ketton_1000c_3p00006um_porosity_field_full.npy'),
 }
 
+# Paths to real porosity volumes for 129 models
+POROSITY_VOLUMES_129 = {
+    'Bentheimer': os.path.join(GPDATA_129_DIR, 'bentheimer', 'bentheimer_porosity_field_full.npy'),
+    'Doddington': os.path.join(GPDATA_129_DIR, 'doddington', 'doddington_porosity_field_full.npy'),
+    'Estaillades': os.path.join(GPDATA_129_DIR, 'estaillades', 'estaillades_porosity_field_full.npy'),
+    'Ketton': os.path.join(GPDATA_129_DIR, 'ketton', 'ketton_porosity_field_full.npy'),
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Generate multi-scale volumes with different conditioning cases'
     )
     parser.add_argument(
-        '--checkpoint', type=str, required=True,
-        help='Path to model checkpoint (post-trained for case 1, ignored for cases 2-4 which use original)'
+        '--checkpoint', type=str, default=None,
+        help='Path to model checkpoint (required for cases 1, 5, 7; ignored for cases 2-4, 6 which use original)'
     )
     parser.add_argument(
         '--stone', type=str, required=True, choices=AVAILABLE_STONES,
@@ -96,8 +117,8 @@ def parse_args():
         help='Device for computation'
     )
     parser.add_argument(
-        '--generation-case', type=int, default=1, choices=[1, 2, 3, 4],
-        help='Generation case: 1=field+post-trained (default), 2=null, 3=scalar, 4=field+original'
+        '--generation-case', type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7],
+        help='Generation case: 1=field+post-trained (default), 2=null, 3=scalar, 4=field+original, 5=field+129-trained, 6=field+original+gpdata4-129, 7=unconditional+provided'
     )
     parser.add_argument(
         '--coarse-n', type=int, default=32,
@@ -168,15 +189,19 @@ def validate_volume_size(pixel_size):
     return latent_size
 
 
-def load_gpdata(stone: str):
+def load_gpdata(stone: str, gpdata_paths=None):
     """Load the GP analysis data for a stone type."""
-    path = GPDATA_PATHS[stone]
+    if gpdata_paths is None:
+        gpdata_paths = GPDATA_PATHS
+    path = gpdata_paths[stone]
     return np.load(path)
 
 
-def load_porosity_volume(stone: str):
+def load_porosity_volume(stone: str, porosity_volumes=None):
     """Load the real porosity volume for a stone type (used for scalar sampling)."""
-    path = POROSITY_VOLUMES[stone]
+    if porosity_volumes is None:
+        porosity_volumes = POROSITY_VOLUMES
+    path = porosity_volumes[stone]
     volume = np.load(path)
     # Crop edges (as done in notebook)
     volume = volume[128:-128, 128:-128, 128:-128]
@@ -190,9 +215,9 @@ def sample_scalar_porosity(porosity_volume):
     return np.array([random_value], dtype=np.float32)
 
 
-def create_porosity_sampler(stone: str, coarse_n: int = 16):
+def create_porosity_sampler(stone: str, coarse_n: int = 16, gpdata_paths=None):
     """Create a MaternFieldSampler initialized for the given stone."""
-    gpdata = load_gpdata(stone)
+    gpdata = load_gpdata(stone, gpdata_paths=gpdata_paths)
 
     sampler = MaternFieldSampler(
         mean_val=float(gpdata['mean_logit']),
@@ -204,9 +229,9 @@ def create_porosity_sampler(stone: str, coarse_n: int = 16):
     return sampler, gpdata
 
 
-def create_periodic_porosity_sampler(stone: str, coarse_n: int = 16):
+def create_periodic_porosity_sampler(stone: str, coarse_n: int = 16, gpdata_paths=None):
     """Create a periodic Matern GP sampler for porosity field."""
-    gpdata = load_gpdata(stone)
+    gpdata = load_gpdata(stone, gpdata_paths=gpdata_paths)
 
     sampler = PeriodicMaternFieldSampler(
         mean_val=float(gpdata['mean_logit']),
@@ -273,7 +298,47 @@ def sample_periodic_porosity_field(sampler, shape, coarse_n):
     return porosity.astype(np.float32)
 
 
-def load_models(checkpoint_path, device, periodic=False, enhanced=False, condition_embed_dim=64):
+def load_unconditional_flow_model(checkpoint_path):
+    """Load an unconditional flow model (no conditional embedding)."""
+    weights = load_model_from_module(checkpoint_path)
+    flowmodelconfig = diffsci2.nets.PUNetGConfig(
+        input_channels=4,
+        output_channels=4,
+        dimension=3,
+        model_channels=64,
+        channel_expansion=[2, 4],
+        number_resnet_downward_block=2,
+        number_resnet_upward_block=2,
+        number_resnet_attn_block=0,
+        number_resnet_before_attn_block=3,
+        number_resnet_after_attn_block=3,
+        kernel_size=3,
+        in_out_kernel_size=3,
+        in_embedding=False,
+        time_projection_scale=10.0,
+        input_projection_scale=1.0,
+        transition_scale_factor=2,
+        transition_kernel_size=3,
+        dropout=0.1,
+        cond_dropout=0.0,
+        first_resblock_norm="GroupLN",
+        second_resblock_norm="GroupRMS",
+        affine_norm=True,
+        convolution_type="default",
+        num_groups=1,
+        attn_residual=False,
+        attn_type="default",
+        bias=True,
+    )
+    flowmodel = diffsci2.nets.PUNetG(
+        flowmodelconfig,
+        conditional_embedding=None,
+    )
+    flowmodel.load_state_dict(weights)
+    return flowmodel
+
+
+def load_models(checkpoint_path, device, periodic=False, enhanced=False, condition_embed_dim=64, unconditional=False):
     """Load flow model and autoencoder.
 
     Args:
@@ -282,9 +347,13 @@ def load_models(checkpoint_path, device, periodic=False, enhanced=False, conditi
         periodic: Whether to use circular convolutions
         enhanced: Whether to use enhanced conditioning wrapper
         condition_embed_dim: Embedding dimension for enhanced conditioning
+        unconditional: Whether to load as unconditional model (no conditional embedding)
     """
     # Load base flow model
-    flowmodel = load_flow_model(checkpoint_path, custom_checkpoint_path=True)
+    if unconditional:
+        flowmodel = load_unconditional_flow_model(checkpoint_path)
+    else:
+        flowmodel = load_flow_model(checkpoint_path, custom_checkpoint_path=True)
     vaemodule = load_autoencoder()
 
     # Wrap with enhanced conditioning if requested
@@ -451,6 +520,9 @@ def get_case_description(case):
         2: "Null conditioning (y=None)",
         3: "Scalar porosity (random from real data)",
         4: "Field porosity with original (scalar-trained) model",
+        5: "Field porosity with 129-trained model (gpdata4-129)",
+        6: "Field porosity with original model (gpdata4-129)",
+        7: "Unconditional with provided checkpoint",
     }
     return descriptions.get(case, "Unknown case")
 
@@ -474,10 +546,12 @@ def main():
 
     # Determine which checkpoint to use based on case
     generation_case = args.generation_case
-    if generation_case == 1:
-        # Use provided (post-trained) checkpoint for case 1
+    if generation_case in [1, 5, 7]:
+        # Use provided checkpoint for case 1 (post-trained), case 5 (129-trained), case 7 (unconditional)
+        if args.checkpoint is None:
+            raise ValueError(f"--checkpoint is required for generation case {generation_case}")
         checkpoint_path = args.checkpoint
-        print(f"Using POST-TRAINED checkpoint for case {generation_case}: {checkpoint_path}")
+        print(f"Using PROVIDED checkpoint for case {generation_case}: {checkpoint_path}")
     else:
         # Use original (scalar-trained) checkpoint for cases 2, 3, 4
         checkpoint_path = ORIGINAL_CHECKPOINTS[args.stone]
@@ -520,7 +594,8 @@ def main():
         args.device,
         periodic=args.periodic,
         enhanced=use_enhanced,
-        condition_embed_dim=args.condition_embed_dim
+        condition_embed_dim=args.condition_embed_dim,
+        unconditional=(generation_case == 7)
     )
     timing['model_load_time'] = time.time() - t_start
     timing['enhanced'] = use_enhanced
@@ -531,14 +606,18 @@ def main():
     gpdata = None
     porosity_volume = None
 
-    if generation_case in [1, 4]:
+    if generation_case in [1, 4, 5, 6]:
         # Need porosity sampler
+        # Cases 5, 6 use GP data fitted on 129-resolution data
+        gpdata_paths = GPDATA_129_PATHS if generation_case in [5, 6] else None
         print(f"Creating porosity sampler for {args.stone}...")
+        if gpdata_paths is not None:
+            print(f"  Using 129 GP data from gpdata4-129")
         if args.periodic:
-            sampler, gpdata = create_periodic_porosity_sampler(args.stone, args.coarse_n)
+            sampler, gpdata = create_periodic_porosity_sampler(args.stone, args.coarse_n, gpdata_paths=gpdata_paths)
             print("  Using periodic porosity sampler")
         else:
-            sampler, gpdata = create_porosity_sampler(args.stone, args.coarse_n)
+            sampler, gpdata = create_porosity_sampler(args.stone, args.coarse_n, gpdata_paths=gpdata_paths)
         print(f"  Mean logit: {gpdata['mean_logit']:.4f}")
         print(f"  Matern params: sigma^2={gpdata['matern_sigma_sq']:.4f}, "
               f"nu={gpdata['matern_nu']:.4f}, l={gpdata['matern_length_scale']:.4f}")
@@ -559,7 +638,7 @@ def main():
 
         latent_size = pixel_size // LATENT_TO_PIXEL_FACTOR
 
-        if variance_test and generation_case in [1, 4]:
+        if variance_test and generation_case in [1, 4, 5, 6]:
             # Variance test mode (only for field-based cases)
             nfields = args.nfields
             nsamples_per_field = args.nsamples_per_field
@@ -610,12 +689,12 @@ def main():
                 t_start = time.time()
 
                 # Generate based on case
-                if generation_case == 1:
+                if generation_case in [1, 5]:
                     x, porosity_data = generate_volume_case1(
                         flowmodule, vaemodule, sampler, pixel_size, args.coarse_n, args.nsteps, args.device, args.guidance,
                         periodic=args.periodic
                     )
-                elif generation_case == 2:
+                elif generation_case in [2, 7]:
                     x, porosity_data = generate_volume_case2(
                         flowmodule, vaemodule, pixel_size, args.nsteps, args.device, args.guidance,
                         periodic=args.periodic
@@ -625,7 +704,7 @@ def main():
                         flowmodule, vaemodule, porosity_volume, pixel_size, args.nsteps, args.device, args.guidance,
                         periodic=args.periodic
                     )
-                else:  # case 4
+                else:  # case 4, 6
                     x, porosity_data = generate_volume_case4(
                         flowmodule, vaemodule, sampler, pixel_size, args.coarse_n, args.nsteps, args.device, args.guidance,
                         periodic=args.periodic

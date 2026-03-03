@@ -124,3 +124,6 @@ repopack-output.txt
 
 # Claude
 claude/*
+
+# Temp
+temp.txt

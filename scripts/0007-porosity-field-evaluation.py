@@ -50,6 +50,10 @@ def parse_args():
         '--pool-kernel', type=int, default=POOL_KERNEL,
         help=f'Average pooling kernel for compression (default: {POOL_KERNEL})'
     )
+    parser.add_argument(
+        '--suffix-kernel-size', action='store_true', default=False,
+        help='If set, include kernel size in the output filename (e.g. .calculated_porosity_256.npy)'
+    )
     return parser.parse_args()
 
 
@@ -104,12 +108,17 @@ def main():
     kernel_size = args.kernel_size
     pool_kernel = args.pool_kernel
     recalculate = args.recalculate_porosity
+    suffix_kernel_size = args.suffix_kernel_size
+
+    porosity_tag = f'calculated_porosity_{kernel_size}' if suffix_kernel_size else 'calculated_porosity'
 
     print(f"Path: {data_dir}")
     print(f"Size: {size}")
     print(f"Kernel size: {kernel_size}")
     print(f"Pool kernel: {pool_kernel}")
     print(f"Recalculate: {recalculate}")
+    print(f"Suffix kernel size: {suffix_kernel_size}")
+    print(f"Porosity tag: {porosity_tag}")
 
     # Get list of all volume files
     names = load_generated_data(data_dir, size)
@@ -117,7 +126,7 @@ def main():
 
     if not recalculate:
         calculated_porosity_names = load_generated_data(
-            data_dir, size, prepattern='calculated_porosity'
+            data_dir, size, prepattern=porosity_tag
         )
         print(f"Found {len(calculated_porosity_names)} already calculated porosity fields")
     else:
@@ -125,7 +134,7 @@ def main():
 
     # Process each volume
     for i, name in enumerate(sorted(names)):
-        expected_output = name.split('.')[0] + '.calculated_porosity.npy'
+        expected_output = name.split('.')[0] + f'.{porosity_tag}.npy'
 
         if not recalculate and expected_output in calculated_porosity_names:
             print(f"[{i+1}/{len(names)}] {name} already calculated, skipping")
@@ -142,7 +151,7 @@ def main():
         field = average_volume(field, pool_kernel)
         print(f"  Compressed field shape: {field.shape}")
 
-        savename = name.replace('.npy', '.calculated_porosity.npy')
+        savename = name.replace('.npy', f'.{porosity_tag}.npy')
         save_path = os.path.join(data_dir, savename)
         np.save(save_path, field)
         print(f"  Saved to {savename}")
