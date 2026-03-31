@@ -120,10 +120,10 @@ def _convert_conv3d(conv, ctx):
     if conv.bias is not None:
         inner_conv.bias.data.copy_(conv.bias.data)
 
-    # Standard Conv3d uses zero padding on H, W
-    hw_pad_modes = ('zeros', 'zeros')
+    # Standard Conv3d uses zero padding on all spatial dims
+    spatial_pad_modes = {2: 'zeros', 3: 'zeros', 4: 'zeros'}
 
-    return SpatialParallelConv3d(inner_conv, k, hw_pad_modes, ctx)
+    return SpatialParallelConv3d(inner_conv, k, spatial_pad_modes, ctx)
 
 
 def _convert_circular_conv3d(circular_conv, ctx):
@@ -134,12 +134,15 @@ def _convert_circular_conv3d(circular_conv, ctx):
     # The inner Conv3d (padding=0) already has the weights
     inner_conv = circular_conv.conv
 
-    # Determine H, W padding modes based on circular_dims
-    # In CircularConv3d: 0=D, 1=H, 2=W
-    h_mode = 'circular' if 1 in circular_dims else 'zeros'
-    w_mode = 'circular' if 2 in circular_dims else 'zeros'
+    # Determine padding modes for each spatial dim
+    # In CircularConv3d: 0=D, 1=H, 2=W -> tensor dims 2, 3, 4
+    spatial_pad_modes = {
+        2: 'circular' if 0 in circular_dims else 'zeros',  # D
+        3: 'circular' if 1 in circular_dims else 'zeros',  # H
+        4: 'circular' if 2 in circular_dims else 'zeros',  # W
+    }
 
-    return SpatialParallelConv3d(inner_conv, k, (h_mode, w_mode), ctx)
+    return SpatialParallelConv3d(inner_conv, k, spatial_pad_modes, ctx)
 
 
 def count_spatial_parallel_layers(module):

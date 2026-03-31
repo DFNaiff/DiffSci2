@@ -16,9 +16,9 @@ from .halo_exchange import exchange_halos, pad_with_halos
 class SpatialParallelConv3d(nn.Module):
     """Drop-in replacement for Conv3d / CircularConv3d with halo exchange.
 
-    The split dimension (D by default) is padded via halo exchange with
-    neighboring GPUs. Other spatial dimensions (H, W) are padded locally
-    using the specified mode (zero or circular).
+    The split dimension is padded via halo exchange with neighboring GPUs.
+    The other two spatial dimensions are padded locally using the specified
+    mode (zero or circular).
 
     Parameters
     ----------
@@ -26,43 +26,50 @@ class SpatialParallelConv3d(nn.Module):
         The underlying convolution with padding=0. Weights are preserved.
     kernel_size : int
         Cubic kernel size (must be odd).
-    hw_pad_modes : tuple of str
-        Padding mode for (H, W): each is 'zeros' or 'circular'.
+    spatial_pad_modes : dict[int, str]
+        Padding mode for each spatial dim {2: mode, 3: mode, 4: mode},
+        where dims refer to [B, C, D, H, W]. Each mode is 'zeros' or
+        'circular'. The split dim entry is ignored (handled by halo exchange).
     ctx : SpatialContext
         Distributed context.
     """
 
-    def __init__(self, conv, kernel_size, hw_pad_modes, ctx):
+    def __init__(self, conv, kernel_size, spatial_pad_modes, ctx):
         super().__init__()
         self.conv = conv  # Conv3d with padding=0, weights already set
         self.halo_width = kernel_size // 2
-        self.hw_pad_modes = hw_pad_modes  # (H_mode, W_mode)
+        self.spatial_pad_modes = spatial_pad_modes  # {2: mode, 3: mode, 4: mode}
         self.ctx = ctx
+
+    @staticmethod
+    def _pad_single_dim(x, dim, p, mode):
+        """Pad a single spatial dimension of a 5D tensor [B, C, D, H, W]."""
+        # F.pad uses reverse dim order: (W_left, W_right, H_left, H_right, D_left, D_right)
+        pad = [0] * 6
+        idx = (4 - dim) * 2  # dim 4 -> idx 0, dim 3 -> idx 2, dim 2 -> idx 4
+        pad[idx] = p
+        pad[idx + 1] = p
+        if mode == 'circular':
+            return F.pad(x, tuple(pad), mode='circular')
+        else:
+            return F.pad(x, tuple(pad), mode='constant', value=0)
 
     def forward(self, x):
         p = self.halo_width
         if p == 0:
             return self.conv(x)
 
-        dim = self.ctx.split_dim  # 2 for D in [B, C, D, H, W]
+        split_dim = self.ctx.split_dim
 
-        # 1. Halo exchange along split dim (D)
+        # 1. Halo exchange along split dim
         recv_left, recv_right = exchange_halos(x, p, self.ctx)
-        x = pad_with_halos(x, recv_left, recv_right, dim=dim)
+        x = pad_with_halos(x, recv_left, recv_right, dim=split_dim)
 
-        # 2. Pad H (dim 3) locally
-        h_mode = self.hw_pad_modes[0]
-        if h_mode == 'circular':
-            x = F.pad(x, (0, 0, p, p, 0, 0), mode='circular')
-        else:
-            x = F.pad(x, (0, 0, p, p, 0, 0), mode='constant', value=0)
-
-        # 3. Pad W (dim 4) locally
-        w_mode = self.hw_pad_modes[1]
-        if w_mode == 'circular':
-            x = F.pad(x, (p, p, 0, 0, 0, 0), mode='circular')
-        else:
-            x = F.pad(x, (p, p, 0, 0, 0, 0), mode='constant', value=0)
+        # 2. Local padding on the two non-split spatial dims
+        for dim in (2, 3, 4):
+            if dim == split_dim:
+                continue
+            x = self._pad_single_dim(x, dim, p, self.spatial_pad_modes[dim])
 
         return self.conv(x)
 
