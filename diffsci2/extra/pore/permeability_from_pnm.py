@@ -132,6 +132,42 @@ class RelativePermeabilityResult:
         """Mean non-wetting phase relative permeability across directions."""
         return np.mean(self.kr_nonwetting, axis=1)
 
+    # --- Interpolation methods ---
+
+    def _make_interpolator(self, x: np.ndarray, y: np.ndarray):
+        """Build a linear interpolator, sorting by x first."""
+        from scipy.interpolate import interp1d
+        order = np.argsort(x)
+        return interp1d(
+            x[order], y[order],
+            kind='linear', bounds_error=False, fill_value=np.nan,
+        )
+
+    def Sw_from_Pc(self, Pc_query):
+        """Interpolate wetting saturation from capillary pressure."""
+        return self._make_interpolator(self.Pc, self.Sw)(np.asarray(Pc_query))
+
+    def Pc_from_Sw(self, Sw_query):
+        """Interpolate capillary pressure from wetting saturation."""
+        return self._make_interpolator(self.Sw, self.Pc)(np.asarray(Sw_query))
+
+    def _kr_column(self, kr_array: np.ndarray, direction: str) -> np.ndarray:
+        """Select a kr column by direction name."""
+        if direction == 'mean':
+            return np.mean(kr_array, axis=1)
+        idx = {'x': 0, 'y': 1, 'z': 2}[direction]
+        return kr_array[:, idx]
+
+    def kr_wetting_from_Sw(self, Sw_query, direction: str = 'mean'):
+        """Interpolate wetting relative permeability from saturation."""
+        y = self._kr_column(self.kr_wetting, direction)
+        return self._make_interpolator(self.Sw, y)(np.asarray(Sw_query))
+
+    def kr_nonwetting_from_Sw(self, Sw_query, direction: str = 'mean'):
+        """Interpolate non-wetting relative permeability from saturation."""
+        y = self._kr_column(self.kr_nonwetting, direction)
+        return self._make_interpolator(self.Sw, y)(np.asarray(Sw_query))
+
 
 # =============================================================================
 # Main Class
@@ -200,31 +236,78 @@ class PoreNetworkPermeability:
     @classmethod
     def from_binary_volume(
         cls,
-        binary_volume: np.ndarray,
+        binary_volume: Optional[np.ndarray] = None,
         voxel_size: float = 1.0,
         trim_disconnected: bool = True,
+        network=None,
+        volume_length: Optional[int] = None,
     ) -> "PoreNetworkPermeability":
         """
-        Create a PoreNetworkPermeability from a 3D binary volume.
+        Create a PoreNetworkPermeability from a 3D binary volume or a
+        pre-extracted network.
+
+        If ``network`` is provided (e.g. loaded from a ``.npz`` file), the
+        binary volume is not needed and SNOW extraction is skipped entirely.
 
         Uses the SNOW algorithm (via poregen.features.snow2) to extract the
-        pore network from the binary volume.
+        pore network from the binary volume when no network is given.
 
         Args:
             binary_volume: 3D numpy array where 0 = pore space, 1 = solid.
-                           Shape should be (Lx, Ly, Lz).
+                           Shape should be (Lx, Ly, Lz). Not required when
+                           ``network`` is provided.
             voxel_size: Physical size of each voxel in meters.
-            crop_length: If provided, crop the volume to a centered cube of
-                         this edge length. Useful for reducing computation time.
             trim_disconnected: If True, remove pores not connected to the
                                main network (recommended).
+            network: A pre-extracted PoreSpy network dict (or NpzFile from
+                     ``np.load``). When provided, the volume is not needed.
+            volume_length: The edge length of the cubic sample in voxels.
+                           Inferred from ``binary_volume.shape[0]`` when a
+                           volume is given, or from ``pore.coords`` bounding
+                           box when only a network is given. Can always be
+                           overridden explicitly.
 
         Returns:
             A new PoreNetworkPermeability instance.
 
         Raises:
-            ImportError: If poregen is not available.
+            ImportError: If poregen is not available (volume path only).
+            ValueError: If neither binary_volume nor network is provided, or
+                        if volume_length cannot be determined.
         """
+        if network is not None:
+            # Convert NpzFile (from np.load) to a plain dict
+            if hasattr(network, 'files'):
+                network_dict = dict(network)
+            else:
+                network_dict = network
+
+            # Determine volume_length
+            if volume_length is not None:
+                pass  # explicitly given, use as-is
+            elif binary_volume is not None:
+                volume_length = binary_volume.shape[0]
+            elif 'pore.coords' in network_dict:
+                coords = network_dict['pore.coords']
+                volume_length = int(np.ceil(coords.max()))
+            else:
+                raise ValueError(
+                    "Cannot determine volume_length. Provide it explicitly, "
+                    "pass binary_volume, or ensure network has 'pore.coords'."
+                )
+
+            return cls.from_porespy_network(
+                network_dict,
+                volume_length=volume_length,
+                voxel_size=voxel_size,
+                trim_disconnected=trim_disconnected,
+            )
+
+        if binary_volume is None:
+            raise ValueError(
+                "Either binary_volume or network must be provided."
+            )
+
         try:
             from poregen.features.snow2 import snow2
         except ImportError:
@@ -233,7 +316,8 @@ class PoreNetworkPermeability:
                 "Install it or use from_porespy_network() with a pre-extracted network."
             )
 
-        volume_length = binary_volume.shape[0]
+        if volume_length is None:
+            volume_length = binary_volume.shape[0]
 
         # SNOW expects pore space = True (1), solid = False (0)
         # Our convention is pore space = 0, solid = 1, so we invert
@@ -448,8 +532,8 @@ class PoreNetworkPermeability:
     def run_drainage_simulation(
         self,
         inlet_face: Literal['xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax'] = 'xmin',
-        contact_angle: float = 140.0,
-        surface_tension: float = 0.48,
+        contact_angle: float = 140.0,  # degrees
+        surface_tension: float = 0.48,  # N/m
     ) -> np.ndarray:
         """
         Run a drainage (non-wetting phase invasion) simulation.

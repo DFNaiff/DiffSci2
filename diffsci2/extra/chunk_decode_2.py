@@ -28,6 +28,10 @@ from typing import List, Tuple, Optional, Union, Callable, Iterator
 from dataclasses import dataclass
 import itertools
 
+import numpy as np
+import tempfile
+import os
+
 import torch
 
 from diffsci2.torchutils import periodic_getitem
@@ -500,6 +504,162 @@ class CPUStageBuffer:
         result = sub.reshape(B, C, *new_spatial)
 
         return result.to(device=device, dtype=dtype, non_blocking=True).contiguous()
+
+
+# Torch dtype -> numpy dtype mapping for mmap
+_TORCH_TO_NUMPY_DTYPE = {
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.float16: np.float16,
+    torch.bfloat16: np.float32,  # numpy has no bfloat16; store as float32
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.int16: np.int16,
+    torch.int8: np.int8,
+    torch.uint8: np.uint8,
+}
+
+
+class MmapStageBuffer:
+    """
+    Disk-backed stage buffer using numpy memory-mapped files.
+
+    Same interface as CPUStageBuffer but stores data on disk, letting the OS
+    page data in/out as needed. This avoids allocating multi-TB CPU RAM buffers
+    for very large volumes (e.g. 2304^3 with 64 channels).
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Buffer shape [B, C, *spatial].
+    dtype : torch.dtype
+        Data type for the buffer.
+    ndim : int
+        Number of spatial dimensions (2 or 3).
+    offload_dir : str or None
+        Directory for the mmap file. If None, uses system temp directory.
+    """
+
+    def __init__(
+        self,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        ndim: int,
+        offload_dir: Optional[str] = None,
+    ):
+        self.ndim = ndim
+        self._shape = shape
+        self._torch_dtype = dtype
+
+        # Handle bfloat16: numpy doesn't support it, so we use float32 on disk
+        self._needs_bf16_cast = (dtype == torch.bfloat16)
+        np_dtype = _TORCH_TO_NUMPY_DTYPE.get(dtype)
+        if np_dtype is None:
+            raise ValueError(f"Unsupported dtype for mmap: {dtype}")
+        self._np_dtype = np_dtype
+
+        # Create temp file
+        if offload_dir is not None:
+            os.makedirs(offload_dir, exist_ok=True)
+        fd, self._filepath = tempfile.mkstemp(
+            suffix='.mmap', prefix='stage_buf_', dir=offload_dir
+        )
+        os.close(fd)
+
+        # Create memory-mapped array (zero-initialized via mode='w+')
+        self._mmap = np.memmap(
+            self._filepath, dtype=self._np_dtype, mode='w+', shape=shape
+        )
+
+        # Create a torch view over the mmap (zero-copy)
+        self.tensor = torch.from_numpy(self._mmap)
+        if self._needs_bf16_cast:
+            # tensor is float32 on disk; callers reading .tensor get float32.
+            # write_block and read_block_periodic handle the cast.
+            pass
+
+    def write_block(
+        self,
+        ranges: Tuple[Tuple[int, int], ...],
+        tile: torch.Tensor
+    ):
+        """
+        Write tile to destination coordinates (same interface as CPUStageBuffer).
+        """
+        slices = [slice(None), slice(None)]  # B, C
+        for (s, e) in ranges:
+            slices.append(slice(s, e))
+
+        src = tile.detach().cpu()
+        if self._needs_bf16_cast:
+            src = src.float()
+        self.tensor[tuple(slices)].copy_(src)
+
+    def read_block_periodic(
+        self,
+        ranges: Tuple[Tuple[int, int], ...],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Read block with periodic wrapping (same interface as CPUStageBuffer).
+        """
+        B, C = self.tensor.shape[:2]
+        spatial_shape = self.tensor.shape[2:]
+
+        # Flatten [B, C, *spatial] -> [B*C, *spatial] for periodic_getitem
+        flat = self.tensor.reshape(B * C, *spatial_shape)
+
+        # Build slices for periodic_getitem
+        indices = [slice(None)]  # Keep B*C dimension
+        for (s, e) in ranges:
+            indices.append(slice(s, e, None))
+
+        # Periodic fetch
+        sub = periodic_getitem(flat, *indices)
+
+        # Reshape back to [B, C, *spatial_tile]
+        new_spatial = sub.shape[1:]
+        result = sub.reshape(B, C, *new_spatial)
+
+        return result.to(device=device, dtype=dtype, non_blocking=True).contiguous()
+
+    def close(self):
+        """Flush and release the mmap, then delete the backing file."""
+        if hasattr(self, '_mmap') and self._mmap is not None:
+            # Drop the torch view first
+            self.tensor = None
+            # Flush and delete the mmap
+            self._mmap.flush()
+            del self._mmap
+            self._mmap = None
+        if hasattr(self, '_filepath') and self._filepath and os.path.exists(self._filepath):
+            os.remove(self._filepath)
+            self._filepath = None
+
+    def __del__(self):
+        self.close()
+
+    def __repr__(self):
+        size_bytes = int(np.prod(self._shape)) * np.dtype(self._np_dtype).itemsize
+        return (
+            f"MmapStageBuffer(shape={self._shape}, dtype={self._torch_dtype}, "
+            f"file={self._filepath}, size={_format_bytes(size_bytes)})"
+        )
+
+
+def _make_stage_buffer(shape, dtype, ndim, use_disk_offload=False, disk_offload_dir=None):
+    """Factory: create either a CPUStageBuffer or MmapStageBuffer."""
+    if use_disk_offload:
+        return MmapStageBuffer(shape, dtype, ndim, offload_dir=disk_offload_dir)
+    else:
+        return CPUStageBuffer(shape, dtype, ndim)
+
+
+def _close_stage_buffer(buf):
+    """Close an MmapStageBuffer (no-op for CPUStageBuffer)."""
+    if isinstance(buf, MmapStageBuffer):
+        buf.close()
 
 
 # ============================================================================
@@ -1278,6 +1438,8 @@ def chunk_decode_strategy_b(
     use_cached_norms: bool = False,
     aggressive_cleaning: bool = False,
     max_stages: Optional[int] = None,
+    use_disk_offload: bool = False,
+    disk_offload_dir: Optional[str] = None,
 ) -> torch.Tensor:
     """
     Dimension-agnostic chunked decode with Strategy B + optional periodic BCs.
@@ -1306,6 +1468,11 @@ def chunk_decode_strategy_b(
                             only cleans once per stage.
         max_stages: If set, stop after this many stages (for profiling/debugging).
                    Output will be intermediate stage buffer, not final decoded image.
+        use_disk_offload: If True, use memory-mapped files on disk instead of CPU
+                         RAM for intermediate stage buffers. Essential for very large
+                         volumes (e.g. 2304^3) where stage buffers exceed available RAM.
+        disk_offload_dir: Directory for mmap temp files when use_disk_offload=True.
+                         If None, uses the system temp directory.
 
     Returns:
         Decoded output tensor [B, C_out, *spatial_out] on CPU
@@ -1337,10 +1504,10 @@ def chunk_decode_strategy_b(
         for s in range(cfg.num_stages)
     ]
 
-    # CPU buffers for each stage
-    stage_bufs: List[Optional[CPUStageBuffer]] = [None] * cfg.num_stages
+    # Stage buffers (CPU tensors or disk-backed mmap)
+    stage_bufs = [None] * cfg.num_stages
     prev_scale = 1
-    prev_buf: Optional[CPUStageBuffer] = None
+    prev_buf = None
 
     # Save training state
     was_training = decoder.training
@@ -1449,17 +1616,20 @@ def chunk_decode_strategy_b(
                     B_ = cfg.batch_size
                     C_out = int(y_tile.shape[1])
                     out_spatial = tuple(L * dest_scale for L in cfg.spatial_shape)
-                    stage_bufs[s] = CPUStageBuffer(
+                    stage_bufs[s] = _make_stage_buffer(
                         shape=(B_, C_out, *out_spatial),
                         dtype=y_tile.dtype,
-                        ndim=cfg.ndim
+                        ndim=cfg.ndim,
+                        use_disk_offload=use_disk_offload,
+                        disk_offload_dir=disk_offload_dir,
                     )
                     dest_buf = stage_bufs[s]
                     dest_created = True
                     buf_shape = (B_, C_out, *out_spatial)
                     buf_bytes = B_ * C_out * int(torch.tensor(out_spatial).prod().item()) * y_tile.element_size()
+                    buf_type = "disk-backed mmap" if use_disk_offload else "CPU"
                     if cfg.debug >= 1:
-                        print(f"    [Buffer] Allocated CPU buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
+                        print(f"    [Buffer] Allocated {buf_type} buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
                     if cfg.debug >= 3:
                         mem_tracker.print_checkpoint(f"Stage {s} buffer allocated", dest_buf.tensor)
 
@@ -1513,7 +1683,13 @@ def chunk_decode_strategy_b(
             mem_tracker.print_checkpoint(f"Stage {s} cleanup complete")
             mem_tracker.print_stage_summary(s)
 
-        # Update for next stage
+        # Update for next stage: close old source buffer (mmap files) to free disk
+        if prev_buf is not None and prev_buf is not dest_buf:
+            _close_stage_buffer(prev_buf)
+            # Clear from stage_bufs list so it won't be closed again
+            for i, b in enumerate(stage_bufs):
+                if b is prev_buf:
+                    stage_bufs[i] = None
         prev_scale = dest_scale
         prev_buf = dest_buf
 
@@ -1529,7 +1705,10 @@ def chunk_decode_strategy_b(
         print(f"\n  ✓ Decode complete. Output shape: {tuple(prev_buf.tensor.shape)}")
 
     # Return last processed stage (may not be final if max_stages was set)
-    return prev_buf.tensor
+    # For mmap buffers, clone to a regular CPU tensor before the file is cleaned up
+    result = prev_buf.tensor.clone() if isinstance(prev_buf, MmapStageBuffer) else prev_buf.tensor
+    _close_stage_buffer(prev_buf)
+    return result
 
 
 def chunk_decode_2d(
@@ -1594,6 +1773,8 @@ def chunk_decode_parallel(
     use_cached_norms: bool = False,
     aggressive_cleaning: bool = False,
     max_stages: Optional[int] = None,
+    use_disk_offload: bool = False,
+    disk_offload_dir: Optional[str] = None,
 ) -> torch.Tensor:
     """
     Multi-GPU parallel chunked decode.
@@ -1686,10 +1867,10 @@ def chunk_decode_parallel(
         aggressive_cleaning=aggressive_cleaning,
     )
 
-    # CPU buffers for each stage
-    stage_bufs: List[Optional[CPUStageBuffer]] = [None] * cfg.num_stages
+    # Stage buffers (CPU tensors or disk-backed mmap)
+    stage_bufs = [None] * cfg.num_stages
     prev_scale = 1
-    prev_buf: Optional[CPUStageBuffer] = None
+    prev_buf = None
 
     # Initialize memory tracker for debug level 3
     mem_tracker = MemoryTracker(devices[0], enabled=(debug >= 3))
@@ -1778,17 +1959,20 @@ def chunk_decode_parallel(
                     B_ = cfg.batch_size
                     C_out = int(y_tile.shape[1])
                     out_spatial = tuple(L * dest_scale for L in cfg.spatial_shape)
-                    stage_bufs[s] = CPUStageBuffer(
+                    stage_bufs[s] = _make_stage_buffer(
                         shape=(B_, C_out, *out_spatial),
                         dtype=y_tile.dtype,
-                        ndim=cfg.ndim
+                        ndim=cfg.ndim,
+                        use_disk_offload=use_disk_offload,
+                        disk_offload_dir=disk_offload_dir,
                     )
                     dest_buf = stage_bufs[s]
                     dest_created = True
                     buf_shape = (B_, C_out, *out_spatial)
                     buf_bytes = B_ * C_out * int(torch.tensor(out_spatial).prod().item()) * y_tile.element_size()
+                    buf_type = "disk-backed mmap" if use_disk_offload else "CPU"
                     if debug >= 1:
-                        print(f"    [Buffer] Allocated CPU buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
+                        print(f"    [Buffer] Allocated {buf_type} buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
                     if debug >= 3:
                         mem_tracker.print_checkpoint(f"Stage {s} buffer allocated", dest_buf.tensor)
 
@@ -1860,10 +2044,12 @@ def chunk_decode_parallel(
                     B_ = cfg.batch_size
                     C_out = int(y_probe.shape[1])
                     out_spatial = tuple(L * dest_scale for L in cfg.spatial_shape)
-                    stage_bufs[s] = CPUStageBuffer(
+                    stage_bufs[s] = _make_stage_buffer(
                         shape=(B_, C_out, *out_spatial),
                         dtype=y_probe.dtype,
-                        ndim=cfg.ndim
+                        ndim=cfg.ndim,
+                        use_disk_offload=use_disk_offload,
+                        disk_offload_dir=disk_offload_dir,
                     )
                     dest_buf = stage_bufs[s]
                     dest_created = True
@@ -1871,8 +2057,9 @@ def chunk_decode_parallel(
                     buf_bytes = B_ * C_out * int(torch.tensor(out_spatial).prod().item()) * y_probe.element_size()
                     del x_probe, y_probe
                     torch.cuda.empty_cache()
+                    buf_type = "disk-backed mmap" if use_disk_offload else "CPU"
                     if debug >= 1:
-                        print(f"    [Buffer] Allocated CPU buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
+                        print(f"    [Buffer] Allocated {buf_type} buffer: {buf_shape} = {_format_bytes(buf_bytes)}")
                     if debug >= 3:
                         mem_tracker.print_checkpoint(f"Stage {s} buffer allocated", dest_buf.tensor)
 
@@ -1906,7 +2093,12 @@ def chunk_decode_parallel(
             mem_tracker.print_checkpoint(f"Stage {s} cleanup complete")
             mem_tracker.print_stage_summary(s)
 
-        # Update for next stage
+        # Update for next stage: close old source buffer (mmap files) to free disk
+        if prev_buf is not None and prev_buf is not dest_buf:
+            _close_stage_buffer(prev_buf)
+            for i, b in enumerate(stage_bufs):
+                if b is prev_buf:
+                    stage_bufs[i] = None
         prev_scale = dest_scale
         prev_buf = dest_buf
 
@@ -1922,7 +2114,9 @@ def chunk_decode_parallel(
         print(f"\n  ✓ Parallel decode complete. Output shape: {tuple(prev_buf.tensor.shape)}")
 
     # Return last processed stage (may not be final if max_stages was set)
-    return prev_buf.tensor
+    result = prev_buf.tensor.clone() if isinstance(prev_buf, MmapStageBuffer) else prev_buf.tensor
+    _close_stage_buffer(prev_buf)
+    return result
 
 
 def chunk_decode_2d_parallel(

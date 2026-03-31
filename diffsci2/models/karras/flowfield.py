@@ -653,11 +653,11 @@ class SIModule(lightning.LightningModule):
         loss = loss * loss_weighting
 
         if mask is not None:
-            # Apply the mask if it is provided
-            # We assume that the mask is 1 where the data is absent
+            # mask=1 where loss should be computed, 0 where it should be skipped
             mask = mask.expand_as(loss)
-            loss = loss * (1 - mask)
-        loss = loss.mean()
+            loss = (loss * mask).sum() / mask.sum().clamp(min=1)
+        else:
+            loss = loss.mean()
         return loss
 
     def sample_timestep(self, nsamples):
