@@ -10,6 +10,7 @@ Supports seven generation cases:
   Case 5: Field porosity with 129-trained model - 129 checkpoint, GP field from gpdata4-129
   Case 6: Field porosity with original model - original checkpoint, GP field from gpdata4-129
   Case 7: Unconditional with provided checkpoint - provided checkpoint, no conditioning
+  Case 8: Field porosity with 257-trained model - 257 checkpoint, GP field from gpdata4-257
 
 Usage:
     python 0004c-porosity-field-generator.py \
@@ -95,6 +96,23 @@ POROSITY_VOLUMES_129 = {
     'Ketton': os.path.join(GPDATA_129_DIR, 'ketton', 'ketton_porosity_field_full.npy'),
 }
 
+# Paths to GP analysis data for 257 models
+GPDATA_257_DIR = os.path.join(NOTEBOOKPATH, 'data', 'gpdata4-257')
+GPDATA_257_PATHS = {
+    'Bentheimer': os.path.join(GPDATA_257_DIR, 'bentheimer', 'bentheimer_porosity_analysis.npz'),
+    'Doddington': os.path.join(GPDATA_257_DIR, 'doddington', 'doddington_porosity_analysis.npz'),
+    'Estaillades': os.path.join(GPDATA_257_DIR, 'estaillades', 'estaillades_porosity_analysis.npz'),
+    'Ketton': os.path.join(GPDATA_257_DIR, 'ketton', 'ketton_porosity_analysis.npz'),
+}
+
+# Paths to real porosity volumes for 257 models
+POROSITY_VOLUMES_257 = {
+    'Bentheimer': os.path.join(GPDATA_257_DIR, 'bentheimer', 'bentheimer_porosity_field_full.npy'),
+    'Doddington': os.path.join(GPDATA_257_DIR, 'doddington', 'doddington_porosity_field_full.npy'),
+    'Estaillades': os.path.join(GPDATA_257_DIR, 'estaillades', 'estaillades_porosity_field_full.npy'),
+    'Ketton': os.path.join(GPDATA_257_DIR, 'ketton', 'ketton_porosity_field_full.npy'),
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -117,8 +135,8 @@ def parse_args():
         help='Device for computation'
     )
     parser.add_argument(
-        '--generation-case', type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7],
-        help='Generation case: 1=field+post-trained (default), 2=null, 3=scalar, 4=field+original, 5=field+129-trained, 6=field+original+gpdata4-129, 7=unconditional+provided'
+        '--generation-case', type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8],
+        help='Generation case: 1=field+post-trained (default), 2=null, 3=scalar, 4=field+original, 5=field+129-trained, 6=field+original+gpdata4-129, 7=unconditional+provided, 8=field+257-trained'
     )
     parser.add_argument(
         '--coarse-n', type=int, default=32,
@@ -523,6 +541,7 @@ def get_case_description(case):
         5: "Field porosity with 129-trained model (gpdata4-129)",
         6: "Field porosity with original model (gpdata4-129)",
         7: "Unconditional with provided checkpoint",
+        8: "Field porosity with 257-trained model (gpdata4-257)",
     }
     return descriptions.get(case, "Unknown case")
 
@@ -546,8 +565,8 @@ def main():
 
     # Determine which checkpoint to use based on case
     generation_case = args.generation_case
-    if generation_case in [1, 5, 7]:
-        # Use provided checkpoint for case 1 (post-trained), case 5 (129-trained), case 7 (unconditional)
+    if generation_case in [1, 5, 7, 8]:
+        # Use provided checkpoint for case 1 (post-trained), case 5 (129-trained), case 7 (unconditional), case 8 (257-trained)
         if args.checkpoint is None:
             raise ValueError(f"--checkpoint is required for generation case {generation_case}")
         checkpoint_path = args.checkpoint
@@ -606,12 +625,19 @@ def main():
     gpdata = None
     porosity_volume = None
 
-    if generation_case in [1, 4, 5, 6]:
+    if generation_case in [1, 4, 5, 6, 8]:
         # Need porosity sampler
-        # Cases 5, 6 use GP data fitted on 129-resolution data
-        gpdata_paths = GPDATA_129_PATHS if generation_case in [5, 6] else None
+        # Cases 5, 6 use GP data fitted on 129-resolution data; case 8 uses 257-resolution data
+        if generation_case in [5, 6]:
+            gpdata_paths = GPDATA_129_PATHS
+        elif generation_case == 8:
+            gpdata_paths = GPDATA_257_PATHS
+        else:
+            gpdata_paths = None
         print(f"Creating porosity sampler for {args.stone}...")
-        if gpdata_paths is not None:
+        if gpdata_paths is not None and generation_case == 8:
+            print(f"  Using 257 GP data from gpdata4-257")
+        elif gpdata_paths is not None:
             print(f"  Using 129 GP data from gpdata4-129")
         if args.periodic:
             sampler, gpdata = create_periodic_porosity_sampler(args.stone, args.coarse_n, gpdata_paths=gpdata_paths)
@@ -638,7 +664,7 @@ def main():
 
         latent_size = pixel_size // LATENT_TO_PIXEL_FACTOR
 
-        if variance_test and generation_case in [1, 4, 5, 6]:
+        if variance_test and generation_case in [1, 4, 5, 6, 8]:
             # Variance test mode (only for field-based cases)
             nfields = args.nfields
             nsamples_per_field = args.nsamples_per_field
@@ -689,7 +715,7 @@ def main():
                 t_start = time.time()
 
                 # Generate based on case
-                if generation_case in [1, 5]:
+                if generation_case in [1, 5, 8]:
                     x, porosity_data = generate_volume_case1(
                         flowmodule, vaemodule, sampler, pixel_size, args.coarse_n, args.nsteps, args.device, args.guidance,
                         periodic=args.periodic

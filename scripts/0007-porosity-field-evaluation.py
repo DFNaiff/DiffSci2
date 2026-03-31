@@ -59,6 +59,7 @@ def parse_args():
 
 def load_generated_data(data_dir, size, return_names=False, prepattern=None):
     """Load all generated volumes of a given size or return their names."""
+    print(data_dir)
     if prepattern is None:
         def filter_pattern(f):
             return f.endswith('.npy') and f.count('.') == 1
@@ -67,6 +68,7 @@ def load_generated_data(data_dir, size, return_names=False, prepattern=None):
             return f.endswith(f'.{prepattern}.npy')
 
     files = os.listdir(data_dir)
+    print(files)
     chosen_volumes = [f for f in files if f.startswith(f'{size}_')
                       and filter_pattern(f)]
     return chosen_volumes

@@ -1,26 +1,23 @@
 #!/usr/bin/env python
 """
-Unconditional 3D latent diffusion model training from scratch.
+Unconditional 3D latent diffusion model training with crop-mask loss.
 
-Trains a 3D flow model in latent space (using the pretrained VAE autoencoder)
-without any conditioning. This is useful for studying diversity at different
-generation sizes — e.g. 128^3 avoids the diversity collapse seen at 256^3.
+Same as 0009, but with a --crop-mask-size option: the loss is only computed
+at the spatial border of the latent volume (the center is cropped out).
+This forces the denoiser to only learn conditional distributions, never
+marginals — the hypothesis is that this generalizes better.
+
+The mask is defined in pixel space and divided by the compression factor (8)
+to get the latent-space border width. Example with subvolume_size=128:
+  --crop-mask-size 32  →  latent_crop=4  →  loss on border of width 4
 
 Usage:
-    # Single GPU with gradient accumulation
-    python scripts/0009-unconditional-training-3d.py \
-        --stone Estaillades \
-        --subvolume-size 128 \
-        --devices 6 \
-        --batch-size 1 \
-        --accumulate-grad-batches 8
-
-    # Multi-GPU
-    python scripts/0009-unconditional-training-3d.py \
-        --stone Estaillades \
-        --subvolume-size 128 \
-        --devices 0,1,2,3 \
-        --batch-size 2
+    python scripts/0009b-unconditional-training-3d-masked.py \
+        --stone Bentheimer \
+        --crop-mask-size 32 \
+        --devices 1,2,3,4,5,6 \
+        --warmup-epochs 2 \
+        --ema-decay 0
 """
 
 import argparse
@@ -41,7 +38,8 @@ import diffsci2.models
 import diffsci2.nets
 import diffsci2.data
 
-from model_loaders import load_autoencoder
+from model_loaders import load_autoencoder, load_model_from_module
+from diffsci2.extra import punetg_converters
 
 
 # =============================================================================
@@ -55,54 +53,113 @@ VOLUME_PATHS = {
     'Ketton': DATA_DIR + 'Ketton_1000c_3p00006um.raw',
 }
 
+COMPRESSION_FACTOR = 8
+LATENT_CHANNELS = 4
+
 
 # =============================================================================
-# UNCONDITIONAL WRAPPER
+# MASKED UNCONDITIONAL WRAPPER
 # =============================================================================
 
-class UnconditionalWrapper(Dataset):
-    """Wraps a VolumeSubvolumeDataset to return {'x': tensor} without 'y' key.
+class MaskedUnconditionalWrapper(Dataset):
+    """Wraps a VolumeSubvolumeDataset to return {'x': tensor, 'mask': tensor}.
 
-    SIModule.training_step does batch.get('y', None), so omitting the key
-    ensures y=None is passed to the model.
+    The mask is a fixed latent-space tensor: 1 where loss is computed (border),
+    0 where loss is skipped (center crop). If mask is None, no mask is returned.
     """
 
-    def __init__(self, base_dataset):
+    def __init__(self, base_dataset, mask=None):
         self.base = base_dataset
+        self.mask = mask  # [C, L, L, L] in latent space, or None
 
     def __len__(self):
         return len(self.base)
 
     def __getitem__(self, idx):
         item = self.base[idx]
-        if isinstance(item, dict):
-            return {'x': item['x']}
-        return {'x': item}
+        x = item['x'] if isinstance(item, dict) else item
+        result = {'x': x}
+        if self.mask is not None:
+            result['mask'] = self.mask
+        return result
+
+
+# =============================================================================
+# CROP MASK
+# =============================================================================
+
+def make_crop_mask(subvolume_size, crop_mask_size):
+    """Create a latent-space crop mask.
+
+    Returns a tensor of shape [C, L, L, L] with:
+      - 1 at the border (loss computed)
+      - 0 at the center (loss skipped)
+
+    Args:
+        subvolume_size: pixel-space cube side (e.g. 128)
+        crop_mask_size: pixel-space border width to keep (e.g. 32)
+
+    Returns:
+        torch.FloatTensor of shape [LATENT_CHANNELS, L, L, L]
+    """
+    assert crop_mask_size % COMPRESSION_FACTOR == 0, (
+        f"crop_mask_size ({crop_mask_size}) must be divisible by {COMPRESSION_FACTOR}"
+    )
+    assert crop_mask_size < subvolume_size // 2, (
+        f"crop_mask_size ({crop_mask_size}) must be < subvolume_size/2 ({subvolume_size // 2})"
+    )
+
+    latent_size = subvolume_size // COMPRESSION_FACTOR
+    latent_crop = crop_mask_size // COMPRESSION_FACTOR
+
+    mask = torch.ones(LATENT_CHANNELS, latent_size, latent_size, latent_size)
+    mask[:, latent_crop:-latent_crop, latent_crop:-latent_crop, latent_crop:-latent_crop] = 0.0
+
+    n_total = latent_size ** 3
+    n_center = (latent_size - 2 * latent_crop) ** 3
+    n_border = n_total - n_center
+    print(f"  Crop mask: latent {latent_size}^3, border width {latent_crop}")
+    print(f"  Loss voxels: {n_border}/{n_total} ({100 * n_border / n_total:.1f}%)")
+
+    return mask
 
 
 # =============================================================================
 # LR SCHEDULER
 # =============================================================================
 
-class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """Cosine annealing with linear warmup."""
+class WarmupConstantCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """Linear warmup, constant plateau, then cosine decay to zero.
 
-    def __init__(self, optimizer, warmup_steps, total_steps, min_lr_ratio=0.01):
+    Timeline (in optimizer steps):
+        [0, warmup_steps)         -> linear warmup from 0 to base_lr
+        [warmup_steps, decay_start) -> constant at base_lr
+        [decay_start, total_steps]  -> cosine decay from base_lr to 0
+
+    If cosine_decay_steps <= 0 or total_steps is None, there is no cosine
+    phase and the scheduler stays constant after warmup.
+    """
+
+    def __init__(self, optimizer, warmup_steps, total_steps=None, cosine_decay_steps=0):
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
-        self.min_lr_ratio = min_lr_ratio
+        self.cosine_decay_steps = cosine_decay_steps
+        if total_steps is not None and cosine_decay_steps > 0:
+            self.decay_start = total_steps - cosine_decay_steps
+        else:
+            self.decay_start = None
         super().__init__(optimizer)
 
     def get_lr(self):
         step = self.last_epoch
         if step < self.warmup_steps:
-            warmup_factor = step / max(1, self.warmup_steps)
-            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+            factor = (step + 1) / self.warmup_steps
+        elif self.decay_start is not None and step >= self.decay_start:
+            progress = (step - self.decay_start) / max(1, self.cosine_decay_steps)
+            factor = 0.5 * (1 + np.cos(np.pi * progress))
         else:
-            progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-            cosine_factor = 0.5 * (1 + np.cos(np.pi * progress))
-            lr_factor = self.min_lr_ratio + (1 - self.min_lr_ratio) * cosine_factor
-            return [base_lr * lr_factor for base_lr in self.base_lrs]
+            factor = 1.0
+        return [base_lr * factor for base_lr in self.base_lrs]
 
 
 # =============================================================================
@@ -155,7 +212,7 @@ def parse_devices(devices_str):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Unconditional 3D latent diffusion model training from scratch',
+        description='Unconditional 3D latent diffusion with crop-mask loss',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -164,6 +221,11 @@ def parse_args():
     parser.add_argument('--stone', type=str, default='Estaillades',
                         choices=['Bentheimer', 'Doddington', 'Estaillades', 'Ketton'],
                         help='Stone type to train on')
+
+    # Crop mask
+    parser.add_argument('--crop-mask-size', type=int, default=0,
+                        help='Pixel-space border width for crop mask (0 = no mask). '
+                             'Must be divisible by 8 and < subvolume_size/2.')
 
     # Data
     parser.add_argument('--data-path', type=str, default=None,
@@ -182,7 +244,7 @@ def parse_args():
                         help='Batch size per GPU')
     parser.add_argument('--accumulate-grad-batches', type=int, default=8,
                         help='Accumulate gradients over N batches')
-    parser.add_argument('--max-epochs', type=int, default=50,
+    parser.add_argument('--max-epochs', type=int, default=40,
                         help='Maximum number of training epochs')
 
     # Model architecture
@@ -199,7 +261,9 @@ def parse_args():
     parser.add_argument('--gradient-clip', type=float, default=1.0,
                         help='Gradient clipping value')
     parser.add_argument('--warmup-epochs', type=int, default=2,
-                        help='Number of epochs for LR warmup')
+                        help='Linear warmup over this many epochs, then constant LR (default: 2)')
+    parser.add_argument('--cosine-decay-epochs', type=int, default=0,
+                        help='Cosine decay to zero over the last N epochs (0 = no decay, constant LR)')
     parser.add_argument('--ema-decay', type=float, default=0.9999,
                         help='EMA decay rate (0 to disable)')
 
@@ -220,6 +284,20 @@ def parse_args():
                         choices=['32', '16-mixed', 'bf16-mixed'],
                         help='Training precision')
 
+    # Periodic convolutions
+    parser.add_argument('--periodic', action='store_true',
+                        help='Use periodic (circular) convolutions during training')
+
+    # Resume from checkpoint
+    parser.add_argument('--from-checkpoint', type=str, default=None,
+                        help='Path to a .ckpt file. By default loads model weights only '
+                             '(fresh optimizer/scheduler/epoch). '
+                             'Combine with --continue-training for full resume.')
+    parser.add_argument('--continue-training', action='store_true',
+                        help='With --from-checkpoint: fully resume training '
+                             '(restore optimizer, scheduler, epoch counter, callbacks). '
+                             'Without this flag, only model weights are loaded.')
+
     # Dev/test
     parser.add_argument('--fast-dev-run', action='store_true',
                         help='Run a single train+val batch for testing')
@@ -237,27 +315,47 @@ def main():
     stone = args.stone
     data_path = args.data_path or VOLUME_PATHS[stone]
 
-    # Default checkpoint directory: {date}-dfn-unconditional-0009-{stone}-{size}
+    # Default checkpoint directory
     if args.checkpoint_dir is None:
         date_str = datetime.now().strftime('%Y%m%d')
+        mask_tag = f'-crop{args.crop_mask_size}' if args.crop_mask_size > 0 else ''
+        periodic_tag = '-periodic' if args.periodic else ''
         checkpoint_dir = (
             f'savedmodels/experimental/'
-            f'{date_str}-dfn-unconditional-0009-{stone.lower()}-{args.subvolume_size}'
+            f'{date_str}-dfn-unconditional-0009b-{stone.lower()}-{args.subvolume_size}{mask_tag}{periodic_tag}'
         )
     else:
         checkpoint_dir = args.checkpoint_dir
 
     print("=" * 70)
-    print(f"Unconditional 3D Latent Diffusion: {stone} @ {args.subvolume_size}^3")
+    print(f"Unconditional 3D Latent Diffusion (masked): {stone} @ {args.subvolume_size}^3")
     print("=" * 70)
     print(f"  Data path: {data_path}")
     print(f"  Checkpoint dir: {checkpoint_dir}")
+    if args.from_checkpoint:
+        mode = "full resume" if args.continue_training else "weights only"
+        print(f"  From checkpoint: {args.from_checkpoint} ({mode})")
     print(f"  Subvolume size: {args.subvolume_size}^3")
+    print(f"  Crop mask size: {args.crop_mask_size} px"
+          f" ({args.crop_mask_size // COMPRESSION_FACTOR} latent)" if args.crop_mask_size > 0 else "  Crop mask: disabled")
+    print(f"  Periodic convolutions: {args.periodic}")
     print(f"  Model channels: {args.model_channels}")
     print(f"  Channel expansion: {args.channel_expansion}")
     print(f"  Effective batch size: {args.batch_size} x {args.accumulate_grad_batches}"
           f" = {args.batch_size * args.accumulate_grad_batches}")
     print(f"  Precision: {args.precision}")
+    print(f"  EMA decay: {args.ema_decay}" + (" (disabled)" if args.ema_decay == 0 else ""))
+    print()
+
+    # =========================================================================
+    # Build crop mask (in latent space)
+    # =========================================================================
+    if args.crop_mask_size > 0:
+        print("Building crop mask...")
+        crop_mask = make_crop_mask(args.subvolume_size, args.crop_mask_size)
+    else:
+        crop_mask = None
+        print("No crop mask (standard unconditional training)")
     print()
 
     # =========================================================================
@@ -281,21 +379,27 @@ def main():
     print("\nCreating datasets...")
     cube_symmetry = diffsci2.data.CubeSymmetry()
 
-    train_dataset = UnconditionalWrapper(diffsci2.data.VolumeSubvolumeDataset(
-        volumes=volume_train,
-        dataset_size=args.dataset_size,
-        subvolume_size=args.subvolume_size,
-        cube_symmetry=cube_symmetry,
-        return_as_dict=True,
-    ))
+    train_dataset = MaskedUnconditionalWrapper(
+        diffsci2.data.VolumeSubvolumeDataset(
+            volumes=volume_train,
+            dataset_size=args.dataset_size,
+            subvolume_size=args.subvolume_size,
+            cube_symmetry=cube_symmetry,
+            return_as_dict=True,
+        ),
+        mask=crop_mask,
+    )
 
-    val_dataset = UnconditionalWrapper(diffsci2.data.VolumeSubvolumeDataset(
-        volumes=volume_val,
-        dataset_size=args.dataset_size // 4,
-        subvolume_size=args.subvolume_size,
-        cube_symmetry=None,
-        return_as_dict=True,
-    ))
+    val_dataset = MaskedUnconditionalWrapper(
+        diffsci2.data.VolumeSubvolumeDataset(
+            volumes=volume_val,
+            dataset_size=args.dataset_size // 4,
+            subvolume_size=args.subvolume_size,
+            cube_symmetry=None,
+            return_as_dict=True,
+        ),
+        mask=crop_mask,
+    )
 
     print(f"  Train samples per epoch: {len(train_dataset)}")
     print(f"  Val samples per epoch: {len(val_dataset)}")
@@ -318,12 +422,18 @@ def main():
 
     # Sanity check
     sample = next(iter(train_loader))
-    print(f"  Sample batch shape: {sample['x'].shape}")
+    print(f"  Sample batch 'x' shape: {sample['x'].shape}")
+    if 'mask' in sample:
+        print(f"  Sample batch 'mask' shape: {sample['mask'].shape}")
+        print(f"  Mask fraction active: {sample['mask'].float().mean():.3f}")
 
     # =========================================================================
     # Create model — unconditional, from scratch
     # =========================================================================
-    print("\nCreating model (from scratch, unconditional)...")
+    if args.from_checkpoint:
+        print(f"\nCreating model (from checkpoint, unconditional)...")
+    else:
+        print("\nCreating model (from scratch, unconditional)...")
     flow_model_config = diffsci2.nets.PUNetGConfig(
         input_channels=4,
         output_channels=4,
@@ -359,6 +469,21 @@ def main():
         config=flow_model_config,
         conditional_embedding=None,
     )
+
+    if args.periodic:
+        print("  Converting convolutions to periodic (circular)...")
+        flow_model = punetg_converters.convert_conv_to_circular(
+            flow_model, [0, 1, 2], True
+        )
+
+    if args.from_checkpoint and not args.continue_training:
+        print(f"  Loading weights from: {args.from_checkpoint}")
+        weights = load_model_from_module(args.from_checkpoint)
+        flow_model.load_state_dict(weights)
+        print("  Weights loaded (fresh optimizer/scheduler/epoch)")
+    elif args.from_checkpoint and args.continue_training:
+        print(f"  Will fully resume from: {args.from_checkpoint}")
+        print("  (optimizer, scheduler, epoch restored by Lightning)")
 
     total_params = sum(p.numel() for p in flow_model.parameters())
     trainable_params = sum(p.numel() for p in flow_model.parameters() if p.requires_grad)
@@ -400,27 +525,29 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # With scheduler_interval="step", Lightning calls scheduler.step() per
-    # optimizer step, not per batch. With gradient accumulation the number of
-    # optimizer steps per epoch is len(train_loader) // accumulate_grad_batches.
-    # In DDP, each GPU processes a shard, so divide by num_devices.
     batches_per_epoch = len(train_loader)
     num_devices = len(parse_devices(args.devices))
+    # In DDP, each GPU processes a shard of the data
     batches_per_gpu = batches_per_epoch // num_devices
     optimizer_steps_per_epoch = batches_per_gpu // args.accumulate_grad_batches
     total_steps = args.max_epochs * optimizer_steps_per_epoch
     warmup_steps = args.warmup_epochs * optimizer_steps_per_epoch
+    cosine_decay_steps = args.cosine_decay_epochs * optimizer_steps_per_epoch
 
     print(f"  Batches per epoch: {batches_per_epoch} total, {batches_per_gpu} per GPU ({num_devices} GPUs)")
-    print(f"  Optimizer steps per epoch: {optimizer_steps_per_epoch}")
+    print(f"  Optimizer steps per epoch: {optimizer_steps_per_epoch} (acc_grad={args.accumulate_grad_batches})")
     print(f"  Total optimizer steps: {total_steps}")
-    print(f"  Warmup steps: {warmup_steps} ({args.warmup_epochs} epochs)")
+    print(f"  Warmup: {args.warmup_epochs} epochs = {warmup_steps} steps")
+    if cosine_decay_steps > 0:
+        print(f"  Cosine decay: last {args.cosine_decay_epochs} epochs = {cosine_decay_steps} steps (to zero)")
+    else:
+        print(f"  LR after warmup: constant")
 
-    scheduler = WarmupCosineScheduler(
+    scheduler = WarmupConstantCosineScheduler(
         optimizer,
         warmup_steps=warmup_steps,
         total_steps=total_steps,
-        min_lr_ratio=0.01,
+        cosine_decay_steps=cosine_decay_steps,
     )
 
     flow_module.set_optimizer_and_scheduler(
@@ -438,7 +565,7 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_callback = pl_callbacks.ModelCheckpoint(
         dirpath=os.path.join(checkpoint_dir, 'checkpoints'),
-        filename='uncond-3d-{epoch:03d}-{val_loss:.6f}',
+        filename='uncond-3d-masked-{epoch:03d}-{val_loss:.6f}',
         save_top_k=3,
         monitor='val_loss',
         mode='min',
@@ -449,6 +576,8 @@ def main():
     if args.ema_decay > 0:
         print(f"  EMA: decay={args.ema_decay}")
         callbacks.append(EMACallback(decay=args.ema_decay))
+    else:
+        print("  EMA: disabled")
 
     callbacks.append(pl_callbacks.LearningRateMonitor(logging_interval='step'))
 
@@ -493,10 +622,12 @@ def main():
     print(f"Checkpoints: {checkpoint_dir}/checkpoints")
     print()
 
+    ckpt_path = args.from_checkpoint if args.continue_training else None
     trainer.fit(
         flow_module,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
+        ckpt_path=ckpt_path,
     )
 
     print("\n" + "=" * 70)

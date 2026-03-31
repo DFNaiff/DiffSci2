@@ -338,46 +338,38 @@ class VolumeSubvolumeWithPorosityDataset(Dataset):
 # LEARNING RATE SCHEDULER WITH WARMUP
 # =============================================================================
 
-class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """
-    Cosine annealing with linear warmup.
+class WarmupConstantCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """Linear warmup, constant plateau, then cosine decay to zero.
 
-    This is a standard choice for fine-tuning:
-    1. Linear warmup: Gradually increase LR from 0 to base_lr
-    2. Cosine decay: Smoothly decrease LR following cosine curve
+    Timeline (in optimizer steps):
+        [0, warmup_steps)         -> linear warmup from 0 to base_lr
+        [warmup_steps, decay_start) -> constant at base_lr
+        [decay_start, total_steps]  -> cosine decay from base_lr to 0
 
-    Why warmup matters for fine-tuning:
-    - Early gradients on new data can be noisy/large
-    - Small LR initially prevents destroying pretrained features
-    - Gradual increase allows model to adapt to new distribution
+    If cosine_decay_steps <= 0 or total_steps is None, there is no cosine
+    phase and the scheduler stays constant after warmup.
     """
 
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_steps: int,
-        total_steps: int,
-        min_lr_ratio: float = 0.01
-    ):
+    def __init__(self, optimizer, warmup_steps, total_steps=None, cosine_decay_steps=0):
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
-        self.min_lr_ratio = min_lr_ratio
+        self.cosine_decay_steps = cosine_decay_steps
+        if total_steps is not None and cosine_decay_steps > 0:
+            self.decay_start = total_steps - cosine_decay_steps
+        else:
+            self.decay_start = None
         super().__init__(optimizer)
 
     def get_lr(self):
         step = self.last_epoch
-
         if step < self.warmup_steps:
-            # Linear warmup: LR goes from 0 to base_lr
-            warmup_factor = step / max(1, self.warmup_steps)
-            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+            factor = (step + 1) / self.warmup_steps
+        elif self.decay_start is not None and step >= self.decay_start:
+            progress = (step - self.decay_start) / max(1, self.cosine_decay_steps)
+            factor = 0.5 * (1 + np.cos(np.pi * progress))
         else:
-            # Cosine decay: LR follows cosine from base_lr to min_lr
-            progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-            cosine_factor = 0.5 * (1 + np.cos(np.pi * progress))
-            # Scale from min_lr_ratio to 1.0
-            lr_factor = self.min_lr_ratio + (1 - self.min_lr_ratio) * cosine_factor
-            return [base_lr * lr_factor for base_lr in self.base_lrs]
+            factor = 1.0
+        return [base_lr * factor for base_lr in self.base_lrs]
 
 
 # =============================================================================
@@ -462,8 +454,7 @@ def parse_args():
 
     # Data source selection
     parser.add_argument('--data-source', type=str, default='gpdata2',
-                        choices=['gpdata2', 'gpdata4-129'],
-                        help='Porosity field data source (gpdata2=original, gpdata4-129=conv kernel 129)')
+                        help='Porosity field data source (e.g., gpdata2, gpdata4-129, gpdata4-257)')
 
     # Center crop option
     parser.add_argument('--center-crop', type=int, default=None,
@@ -500,12 +491,14 @@ def parse_args():
                         help='Weight decay for AdamW')
     parser.add_argument('--gradient-clip', type=float, default=1.0,
                         help='Gradient clipping value')
-    parser.add_argument('--warmup-steps', type=int, default=None,
-                        help='Number of warmup steps for LR scheduler (overrides --warmup-epochs if set)')
     parser.add_argument('--warmup-epochs', type=int, default=2,
-                        help='Number of epochs for warmup (default: 2, fully ramped by end of epoch 2)')
-    parser.add_argument('--ema-decay', type=float, default=0.9999,
+                        help='Linear warmup over this many epochs, then constant LR (default: 2)')
+    parser.add_argument('--cosine-decay-epochs', type=int, default=0,
+                        help='Cosine decay to zero over the last N epochs (0 = no decay, constant LR)')
+    parser.add_argument('--ema-decay', type=float, default=0.99,
                         help='EMA decay rate (0 to disable)')
+    parser.add_argument('--no-validation', action='store_true',
+                        help='Skip validation and use full volume for training')
 
     # Hardware
     parser.add_argument('--devices', type=str, default='0',
@@ -547,17 +540,16 @@ def main():
     elif args.data_source == 'gpdata4-129':
         porosity_path = POROSITY_BASE_DIR + POROSITY_PATHS_GPDATA4_129[stone]
     else:
-        raise ValueError(f"Unknown data source: {args.data_source}")
+        # Generic pattern: {data_source}/{stone_lower}/{stone_lower}_porosity_field_full.npy
+        sl = stone.lower()
+        porosity_path = POROSITY_BASE_DIR + f'{args.data_source}/{sl}/{sl}_porosity_field_full.npy'
 
     # Default checkpoint directory with date
-    # Include data source info in checkpoint name (e.g., 129 for gpdata4-129)
     if args.checkpoint_dir is None:
         from datetime import datetime
         date_str = datetime.now().strftime('%Y%m%d')
-        if args.data_source == 'gpdata4-129':
-            checkpoint_dir = f'models/experimental/{date_str}-dfn-{stone.lower()}-129-porosity-field'
-        else:
-            checkpoint_dir = f'models/experimental/{date_str}-dfn-{stone.lower()}-porosity-field'
+        ds_suffix = f'-{args.data_source}' if args.data_source != 'gpdata2' else ''
+        checkpoint_dir = f'models/experimental/{date_str}-dfn-{stone.lower()}{ds_suffix}-porosity-field'
     else:
         checkpoint_dir = args.checkpoint_dir
 
@@ -613,19 +605,23 @@ def main():
     # =========================================================================
     # STEP 2: Split volumes into train/val
     # =========================================================================
-    # Split along the first axis (z-axis)
-    # Training: [:train_split, :, :]
-    # Validation: [train_split:, :, :]
-    train_split = args.train_split
-
-    print(f"\nSplitting volumes at z={train_split}")
-    volume_train = volume_data[:, :, :train_split]  # [1000, 1000, 700]
-    volume_val = volume_data[:, :, train_split:]    # [1000, 1000, 300]
-    porosity_train = porosity_data[:, :, :train_split]
-    porosity_val = porosity_data[:, :, train_split:]
-
-    print(f"  Training volume: {volume_train.shape}")
-    print(f"  Validation volume: {volume_val.shape}")
+    if args.no_validation:
+        print(f"\nNo validation — using full volume for training")
+        volume_train = volume_data
+        porosity_train = porosity_data
+        volume_val = None
+        porosity_val = None
+        print(f"  Training volume: {volume_train.shape}")
+    else:
+        # Split along the first axis (z-axis)
+        train_split = args.train_split
+        print(f"\nSplitting volumes at z={train_split}")
+        volume_train = volume_data[:, :, :train_split]
+        volume_val = volume_data[:, :, train_split:]
+        porosity_train = porosity_data[:, :, :train_split]
+        porosity_val = porosity_data[:, :, train_split:]
+        print(f"  Training volume: {volume_train.shape}")
+        print(f"  Validation volume: {volume_val.shape}")
 
     # =========================================================================
     # STEP 3: Create datasets
@@ -645,19 +641,6 @@ def main():
         cube_symmetry=cube_symmetry
     )
 
-    # Validation dataset (smaller, no augmentation for consistent evaluation)
-    val_dataset = VolumeSubvolumeWithPorosityDataset(
-        volume=volume_val,
-        porosity_volume=porosity_val,
-        dataset_size=args.dataset_size // 4,  # Fewer validation samples
-        subvolume_size=args.subvolume_size,
-        downsample_factor=args.downsample_factor,
-        cube_symmetry=None  # No augmentation for validation
-    )
-
-    print(f"  Training samples per epoch: {len(train_dataset)}")
-    print(f"  Validation samples per epoch: {len(val_dataset)}")
-
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
@@ -668,13 +651,28 @@ def main():
         drop_last=True  # Avoid batch size issues with DDP
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True
-    )
+    print(f"  Training samples per epoch: {len(train_dataset)}")
+
+    if args.no_validation:
+        val_loader = None
+        print("  Validation: disabled")
+    else:
+        val_dataset = VolumeSubvolumeWithPorosityDataset(
+            volume=volume_val,
+            porosity_volume=porosity_val,
+            dataset_size=args.dataset_size // 4,
+            subvolume_size=args.subvolume_size,
+            downsample_factor=args.downsample_factor,
+            cube_symmetry=None
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        print(f"  Validation samples per epoch: {len(val_dataset)}")
     
     sample_data = next(iter(train_loader))
     print("Volume shape: ", sample_data['x'].shape)
@@ -730,33 +728,36 @@ def main():
         eps=1e-8  # Numerical stability
     )
 
-    # Calculate total training steps for scheduler
-    steps_per_epoch = len(train_loader)
-    total_steps = args.max_epochs * steps_per_epoch
+    # Compute optimizer steps per epoch (accounts for accumulation + DDP)
+    batches_per_epoch = len(train_loader)
+    num_devices = len(parse_devices(args.devices))
+    # In DDP, each GPU processes a shard of the data
+    batches_per_gpu = batches_per_epoch // num_devices
+    optimizer_steps_per_epoch = batches_per_gpu // args.accumulate_grad_batches
+    total_steps = args.max_epochs * optimizer_steps_per_epoch
+    warmup_steps = args.warmup_epochs * optimizer_steps_per_epoch
+    cosine_decay_steps = args.cosine_decay_epochs * optimizer_steps_per_epoch
 
-    # Calculate warmup steps: explicit value or based on warmup_epochs
-    if args.warmup_steps is not None:
-        warmup_steps = args.warmup_steps
+    print(f"  Batches per epoch: {batches_per_epoch} total, {batches_per_gpu} per GPU ({num_devices} GPUs)")
+    print(f"  Optimizer steps per epoch: {optimizer_steps_per_epoch} (acc_grad={args.accumulate_grad_batches})")
+    print(f"  Total optimizer steps: {total_steps}")
+    print(f"  Warmup: {args.warmup_epochs} epochs = {warmup_steps} steps")
+    if cosine_decay_steps > 0:
+        print(f"  Cosine decay: last {args.cosine_decay_epochs} epochs = {cosine_decay_steps} steps (to zero)")
     else:
-        warmup_steps = args.warmup_epochs * steps_per_epoch
+        print(f"  LR after warmup: constant")
 
-    print(f"  Steps per epoch: {steps_per_epoch}")
-    print(f"  Total training steps: {total_steps}")
-    print(f"  Warmup steps: {warmup_steps} ({warmup_steps / steps_per_epoch:.1f} epochs)")
-
-    # Cosine scheduler with warmup
-    scheduler = WarmupCosineScheduler(
+    scheduler = WarmupConstantCosineScheduler(
         optimizer,
         warmup_steps=warmup_steps,
         total_steps=total_steps,
-        min_lr_ratio=0.01  # Final LR = 1% of initial
+        cosine_decay_steps=cosine_decay_steps,
     )
 
-    # Set optimizer in module (required for Lightning)
     flow_module.set_optimizer_and_scheduler(
         optimizer=optimizer,
         scheduler=scheduler,
-        scheduler_interval="step"  # Update LR every step, not every epoch
+        scheduler_interval="step"
     )
 
     # =========================================================================
@@ -770,14 +771,21 @@ def main():
 
     # Checkpoint saving
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_callback = pl_callbacks.ModelCheckpoint(
-        dirpath=os.path.join(checkpoint_dir, 'checkpoints'),
-        filename='porosity-field-{epoch:03d}-{val_loss:.6f}',
-        save_top_k=3,
-        monitor='val_loss',
-        mode='min',
-        save_last=True
-    )
+    if args.no_validation:
+        checkpoint_callback = pl_callbacks.ModelCheckpoint(
+            dirpath=os.path.join(checkpoint_dir, 'checkpoints'),
+            save_top_k=0,
+            save_last=True,
+        )
+    else:
+        checkpoint_callback = pl_callbacks.ModelCheckpoint(
+            dirpath=os.path.join(checkpoint_dir, 'checkpoints'),
+            filename='porosity-field-{epoch:03d}-{val_loss:.6f}',
+            save_top_k=3,
+            monitor='val_loss',
+            mode='min',
+            save_last=True,
+        )
     callbacks.append(checkpoint_callback)
 
     # EMA (if enabled)
@@ -852,13 +860,14 @@ def main():
     trainer.fit(
         flow_module,
         train_dataloaders=train_loader,
-        val_dataloaders=val_loader
+        val_dataloaders=val_loader,
     )
 
     print("\n" + "=" * 60)
     print("Training complete!")
     print("=" * 60)
-    print(f"\nBest checkpoint: {checkpoint_callback.best_model_path}")
+    if not args.no_validation:
+        print(f"\nBest checkpoint: {checkpoint_callback.best_model_path}")
     print(f"Last checkpoint: {checkpoint_callback.last_model_path}")
 
 

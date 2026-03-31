@@ -163,6 +163,16 @@ def parse_args():
         '--chunk-size', type=int, default=40,
         help='Chunk size for VAE decoding (default: 40)'
     )
+    parser.add_argument(
+        '--disk-offload', action='store_true',
+        help='Use disk-backed mmap buffers for chunk decode stage buffers. '
+             'Required for very large volumes (e.g. 2304^3) where intermediate '
+             'stage buffers (~2.85 TB for 64ch) exceed available CPU RAM.'
+    )
+    parser.add_argument(
+        '--disk-offload-dir', type=str, default=None,
+        help='Directory for mmap temp files (default: /tmp/chunk_decode_mmap)'
+    )
     return parser.parse_args()
 
 
@@ -480,7 +490,8 @@ def generate_latent_spatial_parallel(
 # Latent decoding (Phase 2: rank 0 only, single-GPU, no distributed ops)
 # ---------------------------------------------------------------------------
 
-def decode_latent(vaemodule, x_latent, device, periodic=False, chunk_size=40):
+def decode_latent(vaemodule, x_latent, device, periodic=False, chunk_size=40,
+                   use_disk_offload=False, disk_offload_dir=None):
     """Decode a latent tensor to pixel space using chunk_decode on a single GPU.
 
     Parameters
@@ -495,6 +506,12 @@ def decode_latent(vaemodule, x_latent, device, periodic=False, chunk_size=40):
         Whether to use periodic boundary conditions.
     chunk_size : int
         Chunk size for VAE decoding.
+    use_disk_offload : bool
+        If True, use memory-mapped files for intermediate stage buffers instead
+        of CPU RAM. Required for very large volumes where stage buffers exceed
+        available RAM (e.g. 2304^3 with 64 channels = ~2.85 TB).
+    disk_offload_dir : str or None
+        Directory for mmap temp files. If None, uses system temp directory.
 
     Returns
     -------
@@ -504,6 +521,9 @@ def decode_latent(vaemodule, x_latent, device, periodic=False, chunk_size=40):
     latent_shape = list(x_latent.shape)
     pixel_size = x_latent.shape[2] * LATENT_TO_PIXEL_FACTOR
     print(f"  Decoding latent {latent_shape} -> pixel {pixel_size}^3 ...", flush=True)
+    if use_disk_offload:
+        offload_dir = disk_offload_dir or "/tmp/chunk_decode_mmap"
+        print(f"  Using disk-backed mmap buffers (dir: {offload_dir})", flush=True)
     t_decode_start = time.time()
 
     periodicity = [True, True, True] if periodic else [False, False, False]
@@ -519,7 +539,9 @@ def decode_latent(vaemodule, x_latent, device, periodic=False, chunk_size=40):
         [chunk_size, chunk_size, chunk_size],
         device=device,
         periodicity=periodicity,
-        use_cached_norms=True
+        use_cached_norms=True,
+        use_disk_offload=use_disk_offload,
+        disk_offload_dir=disk_offload_dir,
     )
     x = x[0][0].cpu().numpy()
 
@@ -796,7 +818,9 @@ def main():
 
         x = decode_latent(
             vaemodule, latent, device,
-            periodic=args.periodic, chunk_size=args.chunk_size
+            periodic=args.periodic, chunk_size=args.chunk_size,
+            use_disk_offload=args.disk_offload,
+            disk_offload_dir=args.disk_offload_dir,
         )
         del latent
 
