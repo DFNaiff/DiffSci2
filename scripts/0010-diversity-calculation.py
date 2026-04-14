@@ -88,6 +88,11 @@ def parse_args():
         '--max-volumes', type=int, default=None,
         help='Maximum number of generated volumes to process'
     )
+    parser.add_argument(
+        '--recalculate-absolute-permeability', action='store_true',
+        help='Only recalculate K from cached networks (no SNOW2). '
+             'Requires networks to have been saved from a previous run.'
+    )
     return parser.parse_args()
 
 
@@ -145,12 +150,31 @@ def compute_subblock_porosity(volume, block_size, stride, n_blocks):
     return result
 
 
-def compute_subblock_permeability(volume, block_size, stride, n_blocks, voxel_size):
+def _network_cache_path(base_path, tag, i, j, k):
+    """Path for a cached sub-block network."""
+    return f"{base_path}.subblock_{i}_{j}_{k}_{tag}.network.npz"
+
+
+def _save_network(network_dict, save_path):
+    """Save porespy network dictionary to npz file."""
+    save_dict = {}
+    for key, value in network_dict.items():
+        if isinstance(value, np.ndarray):
+            save_dict[key] = value
+        elif isinstance(value, (int, float, str, bool)):
+            save_dict[key] = np.array(value)
+        elif isinstance(value, list):
+            save_dict[key] = np.array(value)
+    np.savez(save_path, **save_dict)
+
+
+def compute_subblock_permeability(volume, block_size, stride, n_blocks, voxel_size,
+                                  cache_base_path=None, tag=None,
+                                  use_cached_networks=False):
     """Compute absolute permeability (K_x, K_y, K_z) for each sub-block.
 
     Returns array of shape [n_blocks, n_blocks, n_blocks, 3].
     """
-    from poregen.features.snow2 import snow2
     from diffsci2.extra.pore.permeability_from_pnm import PoreNetworkPermeability
 
     result = np.full((n_blocks, n_blocks, n_blocks, 3), np.nan, dtype=np.float64)
@@ -161,19 +185,29 @@ def compute_subblock_permeability(volume, block_size, stride, n_blocks, voxel_si
         for j in range(n_blocks):
             for k in range(n_blocks):
                 count += 1
-                x0 = i * stride
-                y0 = j * stride
-                z0 = k * stride
-                subvol = volume[x0:x0+block_size, y0:y0+block_size, z0:z0+block_size]
-
                 print(f"    Sub-block ({i},{j},{k}) [{count}/{total}]", end="")
                 t0 = time.time()
 
                 try:
-                    # Extract pore network
-                    pore_space = 1 - subvol
-                    partitioning = snow2(pore_space, voxel_size=1.0)
-                    network = partitioning.network
+                    net_path = None
+                    if cache_base_path and tag:
+                        net_path = _network_cache_path(cache_base_path, tag, i, j, k)
+
+                    # Try loading cached network
+                    if use_cached_networks and net_path and os.path.exists(net_path):
+                        network = dict(np.load(net_path))
+                    else:
+                        from poregen.features.snow2 import snow2
+                        x0 = i * stride
+                        y0 = j * stride
+                        z0 = k * stride
+                        subvol = volume[x0:x0+block_size, y0:y0+block_size, z0:z0+block_size]
+                        pore_space = 1 - subvol
+                        partitioning = snow2(pore_space, voxel_size=1.0)
+                        network = partitioning.network
+                        # Save network for future reuse
+                        if net_path:
+                            _save_network(network, net_path)
 
                     # Compute absolute permeability only
                     pn_wrapper = PoreNetworkPermeability.from_porespy_network(
@@ -202,19 +236,23 @@ def output_tag(divisions, stride_mode):
     return f"strides_{divisions}_{stride_mode}"
 
 
-def process_volume(volume, volume_side, divisions, stride_mode, voxel_size, porosity_only):
+def process_volume(volume, volume_side, divisions, stride_mode, voxel_size, porosity_only,
+                    cache_base_path=None, tag=None, use_cached_networks=False):
     """Process a single volume: compute porosity and optionally permeability on strided sub-blocks."""
     block_size, stride, n_blocks = compute_stride_grid(volume_side, divisions, stride_mode)
     print(f"  Volume side: {volume_side}, block_size: {block_size}, "
           f"stride: {stride}, n_blocks: {n_blocks} ({n_blocks**3} total)")
 
     # Porosity
-    print(f"  Computing porosity...")
-    t0 = time.time()
-    porosity_array = compute_subblock_porosity(volume, block_size, stride, n_blocks)
-    print(f"  Porosity done in {time.time()-t0:.1f}s")
-    print(f"  Porosity range: [{porosity_array.min():.4f}, {porosity_array.max():.4f}], "
-          f"mean: {porosity_array.mean():.4f}")
+    if volume is not None:
+        print(f"  Computing porosity...")
+        t0 = time.time()
+        porosity_array = compute_subblock_porosity(volume, block_size, stride, n_blocks)
+        print(f"  Porosity done in {time.time()-t0:.1f}s")
+        print(f"  Porosity range: [{porosity_array.min():.4f}, {porosity_array.max():.4f}], "
+              f"mean: {porosity_array.mean():.4f}")
+    else:
+        porosity_array = None
 
     # Permeability
     perm_array = None
@@ -222,7 +260,9 @@ def process_volume(volume, volume_side, divisions, stride_mode, voxel_size, poro
         print(f"  Computing permeability...")
         t0 = time.time()
         perm_array = compute_subblock_permeability(
-            volume, block_size, stride, n_blocks, voxel_size
+            volume, block_size, stride, n_blocks, voxel_size,
+            cache_base_path=cache_base_path, tag=tag,
+            use_cached_networks=use_cached_networks,
         )
         print(f"  Permeability done in {time.time()-t0:.1f}s")
         valid = ~np.isnan(perm_array)
@@ -267,24 +307,36 @@ def main():
                     skip_ref = True
 
         if not skip_ref and os.path.exists(ref_path):
-            print(f"\nProcessing reference: {ref_path}")
-            ref_shape = tuple(args.reference_shape)
-            ref_volume = np.fromfile(ref_path, dtype=np.uint8).reshape(ref_shape)
-            print(f"  Reference shape: {ref_volume.shape}")
+            recalc_only = args.recalculate_absolute_permeability
+            ref_cache_base = os.path.join(data_dir, "reference")
 
-            ref_side = ref_shape[0]  # Assuming cubic
-            porosity_arr, perm_arr = process_volume(
-                ref_volume, ref_side, divisions, stride_mode, voxel_size, porosity_only
-            )
+            if recalc_only:
+                print(f"\nRecalculating reference K from cached networks...")
+                ref_side = args.reference_shape[0]
+                porosity_arr, perm_arr = process_volume(
+                    None, ref_side, divisions, stride_mode, voxel_size,
+                    porosity_only=False,
+                    cache_base_path=ref_cache_base, tag=tag,
+                    use_cached_networks=True,
+                )
+            else:
+                print(f"\nProcessing reference: {ref_path}")
+                ref_shape = tuple(args.reference_shape)
+                ref_volume = np.fromfile(ref_path, dtype=np.uint8).reshape(ref_shape)
+                print(f"  Reference shape: {ref_volume.shape}")
+                ref_side = ref_shape[0]
+                porosity_arr, perm_arr = process_volume(
+                    ref_volume, ref_side, divisions, stride_mode, voxel_size, porosity_only,
+                    cache_base_path=ref_cache_base, tag=tag,
+                )
 
-            np.save(ref_porosity_path, porosity_arr)
-            print(f"  Saved: {os.path.basename(ref_porosity_path)}")
+            if porosity_arr is not None:
+                np.save(ref_porosity_path, porosity_arr)
+                print(f"  Saved: {os.path.basename(ref_porosity_path)}")
 
             if perm_arr is not None:
                 np.save(ref_perm_path, perm_arr)
                 print(f"  Saved: {os.path.basename(ref_perm_path)}")
-
-            del ref_volume
         elif not skip_ref:
             print(f"\nReference file not found: {ref_path}, skipping")
 
@@ -315,26 +367,40 @@ def main():
                     print(f"\n[{vol_idx+1}/{len(volume_paths)}] {vol_name} already calculated, skipping")
                     continue
 
-        print(f"\n[{vol_idx+1}/{len(volume_paths)}] Processing {vol_name}")
-        volume = np.load(vol_path)
+        recalc_only = args.recalculate_absolute_permeability
+        cache_base = os.path.join(data_dir, base_name)
 
-        if args.border_crop > 0:
-            volume = center_crop(volume, args.border_crop)
-            print(f"  Cropped to {volume.shape}")
+        if recalc_only:
+            print(f"\n[{vol_idx+1}/{len(volume_paths)}] Recalculating K for {vol_name}")
+            vol_side = effective_size
+            porosity_arr, perm_arr = process_volume(
+                None, vol_side, divisions, stride_mode, voxel_size,
+                porosity_only=False,
+                cache_base_path=cache_base, tag=tag,
+                use_cached_networks=True,
+            )
+        else:
+            print(f"\n[{vol_idx+1}/{len(volume_paths)}] Processing {vol_name}")
+            volume = np.load(vol_path)
 
-        vol_side = volume.shape[0]
-        porosity_arr, perm_arr = process_volume(
-            volume, vol_side, divisions, stride_mode, voxel_size, porosity_only
-        )
+            if args.border_crop > 0:
+                volume = center_crop(volume, args.border_crop)
+                print(f"  Cropped to {volume.shape}")
 
-        np.save(porosity_out, porosity_arr)
-        print(f"  Saved: {os.path.basename(porosity_out)}")
+            vol_side = volume.shape[0]
+            porosity_arr, perm_arr = process_volume(
+                volume, vol_side, divisions, stride_mode, voxel_size, porosity_only,
+                cache_base_path=cache_base, tag=tag,
+            )
+            del volume
+
+        if porosity_arr is not None:
+            np.save(porosity_out, porosity_arr)
+            print(f"  Saved: {os.path.basename(porosity_out)}")
 
         if perm_arr is not None:
             np.save(perm_out, perm_arr)
             print(f"  Saved: {os.path.basename(perm_out)}")
-
-        del volume
 
     print("\nDone!")
 

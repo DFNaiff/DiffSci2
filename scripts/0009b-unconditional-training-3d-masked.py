@@ -92,12 +92,12 @@ def make_crop_mask(subvolume_size, crop_mask_size):
     """Create a latent-space crop mask.
 
     Returns a tensor of shape [C, L, L, L] with:
-      - 1 at the border (loss computed)
-      - 0 at the center (loss skipped)
+      - 0 at the border (loss skipped — don't learn border statistics)
+      - 1 at the center (loss computed — learn bulk/interior behavior)
 
     Args:
         subvolume_size: pixel-space cube side (e.g. 128)
-        crop_mask_size: pixel-space border width to keep (e.g. 32)
+        crop_mask_size: pixel-space border width to skip (e.g. 32)
 
     Returns:
         torch.FloatTensor of shape [LATENT_CHANNELS, L, L, L]
@@ -112,14 +112,15 @@ def make_crop_mask(subvolume_size, crop_mask_size):
     latent_size = subvolume_size // COMPRESSION_FACTOR
     latent_crop = crop_mask_size // COMPRESSION_FACTOR
 
-    mask = torch.ones(LATENT_CHANNELS, latent_size, latent_size, latent_size)
-    mask[:, latent_crop:-latent_crop, latent_crop:-latent_crop, latent_crop:-latent_crop] = 0.0
+    mask = torch.zeros(LATENT_CHANNELS, latent_size, latent_size, latent_size)
+    mask[:, latent_crop:-latent_crop, latent_crop:-latent_crop, latent_crop:-latent_crop] = 1.0
 
     n_total = latent_size ** 3
     n_center = (latent_size - 2 * latent_crop) ** 3
     n_border = n_total - n_center
     print(f"  Crop mask: latent {latent_size}^3, border width {latent_crop}")
-    print(f"  Loss voxels: {n_border}/{n_total} ({100 * n_border / n_total:.1f}%)")
+    print(f"  Loss voxels (center): {n_center}/{n_total} ({100 * n_center / n_total:.1f}%)")
+    print(f"  Skipped voxels (border): {n_border}/{n_total} ({100 * n_border / n_total:.1f}%)")
 
     return mask
 

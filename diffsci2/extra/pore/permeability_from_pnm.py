@@ -206,6 +206,7 @@ class PoreNetworkPermeability:
         network: openpnm.network.Network,
         volume_length: int,
         voxel_size: float = 1.0,
+        volume_dims: Optional[tuple] = None,
     ):
         """
         Initialize with an existing OpenPNM network.
@@ -216,13 +217,22 @@ class PoreNetworkPermeability:
 
         Args:
             network: An OpenPNM Network object (already processed)
-            volume_length: The edge length of the cubic sample in voxels
+            volume_length: The edge length of the cubic sample in voxels.
+                           Used as fallback when volume_dims is not given.
             voxel_size: Physical size of each voxel in meters (default=1.0 for
                         dimensionless calculations)
+            volume_dims: Tuple (Lx, Ly, Lz) giving the extent of the sample
+                         in each direction (in voxels). When provided, this is
+                         used for per-direction L/A in Darcy's law instead of
+                         assuming a cube with side volume_length.
         """
         self.pn = network
         self.volume_length = volume_length
         self.voxel_size = voxel_size
+        if volume_dims is not None:
+            self.volume_dims = tuple(float(d) for d in volume_dims)
+        else:
+            self.volume_dims = (float(volume_length),) * 3
 
         # Internal state (populated by various methods)
         self._abs_perm_result: Optional[AbsolutePermeabilityResult] = None
@@ -282,14 +292,21 @@ class PoreNetworkPermeability:
             else:
                 network_dict = network
 
-            # Determine volume_length
+            # Determine volume_length and volume_dims
+            volume_dims = None
             if volume_length is not None:
                 pass  # explicitly given, use as-is
             elif binary_volume is not None:
                 volume_length = binary_volume.shape[0]
+                volume_dims = tuple(float(s) for s in binary_volume.shape)
             elif 'pore.coords' in network_dict:
                 coords = network_dict['pore.coords']
                 volume_length = int(np.ceil(coords.max()))
+                # Infer per-axis extents from coordinate bounding box
+                volume_dims = tuple(
+                    float(np.ceil(coords[:, i].max()))
+                    for i in range(3)
+                )
             else:
                 raise ValueError(
                     "Cannot determine volume_length. Provide it explicitly, "
@@ -301,6 +318,7 @@ class PoreNetworkPermeability:
                 volume_length=volume_length,
                 voxel_size=voxel_size,
                 trim_disconnected=trim_disconnected,
+                volume_dims=volume_dims,
             )
 
         if binary_volume is None:
@@ -341,6 +359,7 @@ class PoreNetworkPermeability:
         volume_length: int,
         voxel_size: float = 1.0,
         trim_disconnected: bool = True,
+        volume_dims: Optional[tuple] = None,
     ) -> "PoreNetworkPermeability":
         """
         Create a PoreNetworkPermeability from a PoreSpy network dictionary.
@@ -353,6 +372,7 @@ class PoreNetworkPermeability:
             volume_length: The edge length of the cubic sample in voxels.
             voxel_size: Physical size of each voxel in meters.
             trim_disconnected: If True, remove disconnected pores.
+            volume_dims: Tuple (Lx, Ly, Lz) for non-cubic samples.
 
         Returns:
             A new PoreNetworkPermeability instance.
@@ -371,7 +391,8 @@ class PoreNetworkPermeability:
         # These map PoreSpy output names to OpenPNM expected names
         cls._setup_network_geometry(pn)
 
-        return cls(pn, volume_length=volume_length, voxel_size=voxel_size)
+        return cls(pn, volume_length=volume_length, voxel_size=voxel_size,
+                   volume_dims=volume_dims)
 
     @classmethod
     def from_openpnm_network(
@@ -381,6 +402,7 @@ class PoreNetworkPermeability:
         voxel_size: float = 1.0,
         trim_disconnected: bool = True,
         setup_geometry: bool = True,
+        volume_dims: Optional[tuple] = None,
     ) -> "PoreNetworkPermeability":
         """
         Create a PoreNetworkPermeability from an existing OpenPNM network.
@@ -395,6 +417,7 @@ class PoreNetworkPermeability:
             trim_disconnected: If True, remove disconnected pores.
             setup_geometry: If True, set up standard geometry properties.
                             Set to False if properties are already configured.
+            volume_dims: Tuple (Lx, Ly, Lz) for non-cubic samples.
 
         Returns:
             A new PoreNetworkPermeability instance.
@@ -408,7 +431,8 @@ class PoreNetworkPermeability:
         if setup_geometry:
             cls._setup_network_geometry(network)
 
-        return cls(network, volume_length=volume_length, voxel_size=voxel_size)
+        return cls(network, volume_length=volume_length, voxel_size=voxel_size,
+                   volume_dims=volume_dims)
 
     @staticmethod
     def _setup_network_geometry(pn: openpnm.network.Network) -> None:
@@ -424,15 +448,20 @@ class PoreNetworkPermeability:
         if 'pore.equivalent_diameter' in pn:
             pn['pore.diameter'] = pn['pore.equivalent_diameter']
 
-        # Throat diameter: use inscribed diameter (conservative choice)
-        if 'throat.inscribed_diameter' in pn:
+        # Throat diameter for conductance: use equivalent diameter
+        # (from cross-sectional area, r_e = sqrt(area/pi)).
+        # This is the physically correct choice for Hagen-Poiseuille
+        # conductance through non-circular cross-sections.
+        if 'throat.equivalent_diameter' in pn:
+            pn['throat.diameter'] = pn['throat.equivalent_diameter']
+        elif 'throat.inscribed_diameter' in pn:
             pn['throat.diameter'] = pn['throat.inscribed_diameter']
 
         # Throat spacing: use total length (pore-to-pore distance)
         if 'throat.total_length' in pn:
             pn['throat.spacing'] = pn['throat.total_length']
 
-        # Compute throat radius for convenience
+        # Compute throat radius for convenience (used in conductance)
         if 'throat.diameter' in pn:
             pn['throat.radius'] = pn['throat.diameter'] / 2.0
 
@@ -483,9 +512,13 @@ class PoreNetworkPermeability:
         # Create a dummy phase for flow simulation
         phase = openpnm.phase.Phase(network=self.pn)
 
-        # Sample geometry (in voxels)
-        L = self.volume_length  # length in flow direction
-        A = self.volume_length ** 2  # cross-sectional area
+        # Per-direction Darcy geometry (L = flow length, A = cross-section)
+        Lx, Ly, Lz = self.volume_dims
+        dims_LA = {
+            'x': (Lx, Ly * Lz),
+            'y': (Ly, Lx * Lz),
+            'z': (Lz, Lx * Ly),
+        }
 
         K_results = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
@@ -511,6 +544,7 @@ class PoreNetworkPermeability:
             # Compute permeability from Darcy's law:
             # Q = K * A * dP / (mu * L)  =>  K = Q * L / (A * dP)
             # With mu=1 and dP=1, K = Q * L / A (dimensionless, in voxel units)
+            L, A = dims_LA[direction]
             Q = sf.rate(pores=inlet_pores)[0]
             K_results[direction] = Q * (L / A)
 
@@ -529,11 +563,19 @@ class PoreNetworkPermeability:
     # Drainage Simulation
     # =========================================================================
 
+    _OPPOSITE_FACE = {
+        'xmin': 'xmax', 'xmax': 'xmin',
+        'ymin': 'ymax', 'ymax': 'ymin',
+        'zmin': 'zmax', 'zmax': 'zmin',
+    }
+
     def run_drainage_simulation(
         self,
         inlet_face: Literal['xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax'] = 'xmin',
         contact_angle: float = 140.0,  # degrees
         surface_tension: float = 0.48,  # N/m
+        trapping: bool = False,
+        outlet_face: Optional[Literal['xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax']] = None,
     ) -> np.ndarray:
         """
         Run a drainage (non-wetting phase invasion) simulation.
@@ -556,6 +598,13 @@ class PoreNetworkPermeability:
             contact_angle: Contact angle of the non-wetting phase [degrees].
                            >90 means non-wetting. Default 140 (mercury-like).
             surface_tension: Interfacial tension [N/m]. Default 0.48 (mercury/air).
+            trapping: If True, apply trapping after drainage. Defending-phase
+                      clusters disconnected from the outlet face are marked as
+                      trapped and cannot be invaded. This yields realistic
+                      residual saturations.
+            outlet_face: Face where the defending phase can escape (required
+                         for trapping). If None and trapping is True, defaults
+                         to the face opposite the inlet.
 
         Returns:
             Array of unique capillary pressures (Pc) at which invasion events
@@ -566,10 +615,15 @@ class PoreNetworkPermeability:
             - Physical throat diameters are computed using self.voxel_size
             - Entry pressure uses the Washburn equation: Pc = -4*sigma*cos(theta)/d
         """
-        # Compute physical throat diameters for capillary pressure calculation
-        self.pn['throat.physical_diameter'] = (
-            self.pn['throat.diameter'] * self.voxel_size
-        )
+        # Compute physical throat diameters for capillary entry pressure.
+        # Use inscribed diameter (narrowest constriction) for Washburn Pc,
+        # NOT the equivalent diameter used for conductance. The meniscus
+        # must fit through the tightest opening to invade.
+        if 'throat.inscribed_diameter' in self.pn:
+            capillary_diameter = self.pn['throat.inscribed_diameter']
+        else:
+            capillary_diameter = self.pn['throat.diameter']
+        self.pn['throat.physical_diameter'] = capillary_diameter * self.voxel_size
 
         # Create non-wetting phase and set properties
         nwp = openpnm.phase.Phase(network=self.pn)
@@ -593,7 +647,19 @@ class PoreNetworkPermeability:
         drn = openpnm.algorithms.Drainage(network=self.pn, phase=nwp)
         inlet_pores = self.pn.pores(inlet_face)
         drn.set_inlet_BC(pores=inlet_pores)
+
+        # Set outlet BC for trapping (defending phase escape route)
+        if trapping:
+            if outlet_face is None:
+                outlet_face = self._OPPOSITE_FACE[inlet_face]
+            outlet_pores = self.pn.pores(outlet_face)
+            drn.set_outlet_BC(pores=outlet_pores)
+
         drn.run()
+
+        # Apply trapping: disconnected defending-phase clusters become trapped
+        if trapping:
+            drn.apply_trapping()
 
         # Cache the drainage algorithm for relative permeability calculations
         self._drainage_algorithm = drn
@@ -674,9 +740,13 @@ class PoreNetworkPermeability:
         throat_vol = self.pn.get('throat.volume', np.zeros(self.pn.Nt))
         total_vol = pore_vol.sum() + throat_vol.sum()
 
-        # Geometry for permeability calculation
-        L = self.volume_length
-        A = self.volume_length ** 2
+        # Per-direction Darcy geometry
+        Lx, Ly, Lz = self.volume_dims
+        dims_LA = {
+            'x': (Lx, Ly * Lz),
+            'y': (Ly, Lx * Lz),
+            'z': (Lz, Lx * Ly),
+        }
 
         # Results storage
         results = {
@@ -711,8 +781,7 @@ class PoreNetworkPermeability:
                 pore_mask=pore_invaded,
                 K_abs=K_abs,
                 directions=directions,
-                L=L,
-                A=A,
+                dims_LA=dims_LA,
             )
             results['kr_nonwetting'].append(kr_nwp_dir)
 
@@ -723,8 +792,7 @@ class PoreNetworkPermeability:
                 pore_mask=~pore_invaded,
                 K_abs=K_abs,
                 directions=directions,
-                L=L,
-                A=A,
+                dims_LA=dims_LA,
             )
             results['kr_wetting'].append(kr_wp_dir)
 
@@ -741,8 +809,7 @@ class PoreNetworkPermeability:
         pore_mask: np.ndarray,
         K_abs: np.ndarray,
         directions: Sequence[str],
-        L: float,
-        A: float,
+        dims_LA: dict,
     ) -> list[float]:
         """
         Calculate relative permeability for a phase given its occupation mask.
@@ -754,8 +821,7 @@ class PoreNetworkPermeability:
             pore_mask: Boolean array - True where this phase occupies pores.
             K_abs: Absolute permeability array [K_x, K_y, K_z].
             directions: Which directions to calculate.
-            L: Sample length.
-            A: Sample cross-sectional area.
+            dims_LA: Dict mapping direction -> (L, A) for Darcy geometry.
 
         Returns:
             List of relative permeabilities [kr_x, kr_y, kr_z] (or subset based
@@ -800,6 +866,7 @@ class PoreNetworkPermeability:
                 sf.run()
 
                 # Compute effective permeability (dimensionless)
+                L, A = dims_LA[direction]
                 Q = sf.rate(pores=inlet_pores)[0]
                 K_eff = Q * (L / A)
 

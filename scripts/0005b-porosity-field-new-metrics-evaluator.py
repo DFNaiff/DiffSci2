@@ -123,6 +123,15 @@ def parse_args():
         '--max-volumes', type=int, default=None,
         help='Maximum number of volumes to process per size (default: all)'
     )
+    parser.add_argument(
+        '--use-cached-network', action='store_true',
+        help='Skip SNOW2 extraction, load cached .network.npz files instead'
+    )
+    parser.add_argument(
+        '--recalculate-absolute-permeability', action='store_true',
+        help='Only recalculate K_abs from cached networks and patch existing results. '
+             'Does not load volumes or re-run drainage/kr.'
+    )
     return parser.parse_args()
 
 
@@ -235,6 +244,96 @@ def save_network(network_dict, save_path):
     np.savez(save_path, **save_dict)
 
 
+def compute_abs_perm_from_network(network_path, voxel_size):
+    """Load a cached .network.npz and compute only absolute permeability."""
+    net = np.load(network_path)
+    pnp = PoreNetworkPermeability.from_binary_volume(
+        network=net, voxel_size=voxel_size,
+    )
+    K = pnp.calculate_absolute_permeability()
+    return {
+        'K_abs_x': K.K_x, 'K_abs_y': K.K_y, 'K_abs_z': K.K_z,
+        'K_abs_mean': K.K_mean,
+        'K_abs_x_physical': K.K_x_physical,
+        'K_abs_y_physical': K.K_y_physical,
+        'K_abs_z_physical': K.K_z_physical,
+        'K_abs_mean_physical': K.K_mean_physical,
+    }
+
+
+def recalculate_abs_perm_only(args, output_path, voxel_length, generated_dir, reference_path):
+    """Patch K_abs values in existing results using cached networks."""
+    if not os.path.exists(output_path):
+        raise FileNotFoundError(f"Existing results not found: {output_path}")
+
+    print(f"Loading existing results from {output_path}...")
+    existing = dict(np.load(output_path, allow_pickle=True))
+    patched = dict(existing)
+
+    # --- Patch reference ---
+    if reference_path is not None:
+        ref_net_path = reference_path.replace('.raw', '.network.npz')
+        if os.path.exists(ref_net_path):
+            print(f"\nRecalculating reference K_abs from {ref_net_path}...")
+            K = compute_abs_perm_from_network(ref_net_path, voxel_length)
+            for key, val in K.items():
+                patched[f'reference_{key}'] = val
+            print(f"  K_abs (mean): {K['K_abs_mean_physical'] * 1e15:.2f} mD")
+        else:
+            print(f"  Reference network not found: {ref_net_path}, skipping")
+
+    # --- Patch generated volumes ---
+    volume_sizes = [int(x.strip()) for x in args.volume_sizes.split(',')]
+    for size in volume_sizes:
+        n_key = f'generated_{size}_n_volumes'
+        if n_key not in existing:
+            print(f"\nNo existing results for size {size}, skipping")
+            continue
+
+        n_vols = int(existing[n_key])
+        volume_paths = get_generated_volume_paths(generated_dir, size)
+        if args.max_volumes is not None:
+            volume_paths = volume_paths[:args.max_volumes]
+
+        print(f"\nRecalculating K_abs for {n_vols} generated {size}^3 volumes...")
+
+        K_lists = {k: [] for k in [
+            'K_abs_x', 'K_abs_y', 'K_abs_z', 'K_abs_mean',
+            'K_abs_x_physical', 'K_abs_y_physical', 'K_abs_z_physical',
+            'K_abs_mean_physical',
+        ]}
+
+        for vol_idx, vol_path in enumerate(volume_paths[:n_vols]):
+            net_path = vol_path.replace('.npy', '.network.npz')
+            if not os.path.exists(net_path):
+                print(f"  [{vol_idx+1}/{n_vols}] MISSING: {os.path.basename(net_path)}")
+                continue
+
+            K = compute_abs_perm_from_network(net_path, voxel_length)
+            for key in K_lists:
+                K_lists[key].append(K[key])
+            print(f"  [{vol_idx+1}/{n_vols}] {os.path.basename(vol_path)}: "
+                  f"K_abs={K['K_abs_mean_physical']*1e15:.2f} mD")
+
+        # Patch arrays
+        for key, vals in K_lists.items():
+            if len(vals) > 0:
+                patched[f'generated_{size}_{key}'] = np.array(vals)
+
+        if len(K_lists['K_abs_mean_physical']) > 0:
+            perms = np.array(K_lists['K_abs_mean_physical']) * 1e15
+            print(f"  Summary: K_abs (mD): mean={perms.mean():.2f}, std={perms.std():.2f}")
+
+    # Save patched results
+    print(f"\nSaving patched results to {output_path}...")
+    save_dict = {}
+    for k, v in patched.items():
+        if v is not None:
+            save_dict[k] = v
+    np.savez(output_path, **save_dict)
+    print("Done!")
+
+
 def main():
     args = parse_args()
 
@@ -269,6 +368,12 @@ def main():
     print(f"Contact angle: {args.contact_angle} deg")
     print(f"Surface tension: {args.surface_tension} N/m")
 
+    # --- Fast path: recalculate only K_abs from cached networks ---
+    if args.recalculate_absolute_permeability:
+        print("\n*** Recalculating absolute permeability only (patching existing results) ***")
+        recalculate_abs_perm_only(args, output_path, voxel_length, generated_dir, reference_path)
+        return
+
     # Timing
     timing = {}
 
@@ -292,12 +397,16 @@ def main():
         # NOTE: No border crop for reference - it's already the correct full volume.
         # Border crop is only for generated volumes (to remove boundary artifacts).
 
-        # Extract and save network
-        print(f"  Extracting pore network...")
-        network = extract_porespy_network(reference_data)
+        # Extract or load network
         network_path = reference_path.replace('.raw', '.network.npz')
-        save_network(network, network_path)
-        print(f"  Saved network to {network_path}")
+        if args.use_cached_network and os.path.exists(network_path):
+            print(f"  Loading cached network from {network_path}...")
+            network = dict(np.load(network_path))
+        else:
+            print(f"  Extracting pore network...")
+            network = extract_porespy_network(reference_data)
+            save_network(network, network_path)
+            print(f"  Saved network to {network_path}")
 
         # Compute metrics (reusing the already-extracted network)
         print(f"  Computing two-phase flow metrics...")
@@ -352,11 +461,15 @@ def main():
             if args.border_crop > 0:
                 volume = center_crop(volume, args.border_crop)
 
-            # Extract and save network (before openpnm conversion)
-            network = extract_porespy_network(volume)
+            # Extract or load network
             network_path = vol_path.replace('.npy', '.network.npz')
-            save_network(network, network_path)
-            print(f"    Saved network to {os.path.basename(network_path)}")
+            if args.use_cached_network and os.path.exists(network_path):
+                print(f"    Loading cached network from {os.path.basename(network_path)}")
+                network = dict(np.load(network_path))
+            else:
+                network = extract_porespy_network(volume)
+                save_network(network, network_path)
+                print(f"    Saved network to {os.path.basename(network_path)}")
 
             # Compute two-phase flow metrics (reusing the already-extracted network)
             try:
