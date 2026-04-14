@@ -121,3 +121,9 @@ notebooks/exploratory/*
 repopack-output.txt
 
 */old/*
+
+# Claude
+claude/*
+
+# Temp
+temp.txt
