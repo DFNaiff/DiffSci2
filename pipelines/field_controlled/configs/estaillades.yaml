@@ -1,0 +1,55 @@
+# Estaillades — field-controlled latent diffusion configuration.
+# See bentheimer.yaml for the full comment block.
+#
+# Shipping runs:
+#   FC-257: savedmodels/experimental/20260325-dfn-estaillades-gpdata4-257-porosity-field
+#   FC-129: savedmodels/experimental/20260328-dfn-estaillades-gpdata4-129-porosity-field
+
+rock: Estaillades
+
+data:
+  volume_filename: Estaillades_1000c_3p31136um.raw
+  volume_shape: [1000, 1000, 1000]
+  voxel_size_um: 3.31136
+
+field:
+  fc257:
+    radius: 128
+  fc129:
+    radius: 64
+
+base_training:
+  subvolume_size: 256
+  epochs: 50
+  samples_per_epoch: 34560
+  batch_size: 1
+  accumulate_grad_batches: 8
+  lr: 1.0e-4
+  warmup_steps: 1000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  cond_dropout: 0.1
+  sigma_min: 0.002
+  sigma_max: 80.0
+  sigma_data: 0.5
+  train_split_along_last_axis: 700
+
+field_training:
+  subvolume_size: 256
+  epochs: 20
+  samples_per_epoch: 34560
+  batch_size: 1
+  accumulate_grad_batches: 8
+  lr: 2.0e-5
+  warmup_epochs: 2
+  weight_decay: 0.01
+  grad_clip: 1.0
+  ema_decay: 0.99
+  downsample_factor: 8
+  train_split_along_last_axis: 600
+
+generation:
+  target_size: 1024
+  border_crop: 128
+  ode_steps: 21
+  coarse_grid_size: 32
