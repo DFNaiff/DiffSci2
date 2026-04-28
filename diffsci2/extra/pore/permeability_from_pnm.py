@@ -23,7 +23,7 @@ Example usage:
     >>> # Run drainage and get relative permeability curves
     >>> results = pnp.run_drainage_simulation()
     >>> rel_perm = pnp.calculate_relative_permeability_curves()
-
+/home/ubuntu/repos/DiffSci2/diffsci2/extra/pore
 Author: Generated from notebook 0014-two-phase-flow-network-metrics.ipynb
 """
 

@@ -127,3 +127,7 @@ claude/*
 
 # Temp
 temp.txt
+
+# Env
+.env
+.env.local
