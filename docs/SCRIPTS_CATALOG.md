@@ -1,13 +1,33 @@
-# Scripts Catalog — `scripts/`
+# Scripts Catalog
 
-Every numbered `0001`–`0012` script in `scripts/`, with its one-line role,
-pipeline stage, and **status**. Distilled from
-`claude/plan/thesis-reproduction/` reports 01–03 and 06, and verified against
-`ls scripts/` on this checkout.
+Every numbered `0001`–`0012` script, with its one-line role, pipeline stage, and
+**status**. Distilled from `claude/plan/thesis-reproduction/` reports 01–03 and 06.
 
 > **The numbered prefix is a LINEAGE, not a stable API.** Several numbers have
 > multiple superseded variants. Do not run a superseded variant by accident —
 > always use the **canonical** script for its stage.
+
+## Locations after the reorg
+
+The mess was physically resolved (not just documented):
+
+- **CANONICAL field-controlled pipeline → `pipelines/fieldcontrolled/`** — the 10
+  scripts marked **CANONICAL** for the thesis (field-controlled) line:
+  `0002-…-estimator`, `0003-…-training`, `0004e-…-generator`,
+  `0005-…-metrics-evaluator`, `0005-…-large-pnm`, `0005b-…-new-metrics-evaluator`,
+  `0005b-rerun-drainage`, `0005d-…-large-subvol`, `0010-diversity-calculation`,
+  `0011-oil-water-flow`. (See `pipelines/fieldcontrolled/README.md`.)
+- **SUPERSEDED / DEAD → `scripts/old/`** — a tracked archive (19 scripts: the
+  `0004`/`0004c`/`0004d` lineage, drosophila/2D side-experiments, `0005c`,
+  `0005d-buckley-leverett`, `0006`, `0007`, `0008`, `0012-*`, …).
+- **Stays in `scripts/`** — the **unconditional** branch (`0009`,
+  `0009b`-masked/lysm) and general utilities (`download_imperial_rocks.py`,
+  `clean_corrupted_notebook.py`, `diagnose_conditioning.py`,
+  `test_spatial_parallel.py`).
+
+The `Script` column below keeps bare filenames; resolve the location via the
+**Status** column (CANONICAL → `pipelines/fieldcontrolled/`; SUPERSEDED/DEAD →
+`scripts/old/`; the two `0009*` + utilities → `scripts/`).
 
 ## Canonical thesis spine
 

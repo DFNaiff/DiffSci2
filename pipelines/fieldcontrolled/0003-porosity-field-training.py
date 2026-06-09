@@ -119,7 +119,7 @@ import lightning.pytorch.callbacks as pl_callbacks
 from torch.utils.data import Dataset, DataLoader
 
 # Add the aux directory for model_loaders (contains load_flow_model, load_autoencoder)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'notebooks', 'exploratory', 'dfn', 'aux'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'notebooks', 'exploratory', 'dfn', 'aux'))
 
 import diffsci2.models
 import diffsci2.nets

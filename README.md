@@ -75,30 +75,31 @@ RAW rock volumes (Imperial College: Bentheimer, Doddington, Estaillades, Ketton)
 GP porosity-field training data  ──  gpdata4-129 (window 129) / gpdata4-257 (window 257)
    |     (per-stone *_porosity_field_full.npy, 1000^3 float64; + *_porosity_analysis.npz Matern params)
    v
-[TRAIN]  scripts/0003-porosity-field-training.py   →  checkpoint
+[TRAIN]  pipelines/fieldcontrolled/0003-porosity-field-training.py   →  checkpoint
    |        (per stone × {129 crop64, 257 crop128}; frozen VAE = savedmodels/pore/production/converted_vaenet.ckpt)
    v
-[GENERATE]  scripts/0004e-porosity-field-generator.py   (two stages)
+[GENERATE]  pipelines/fieldcontrolled/0004e-porosity-field-generator.py   (two stages)
    |   Stage 1  --mode latent   (torchrun, multi-GPU, spatial-parallel) → latents/*.latent.pt
    |   Stage 2  --mode decode   (1 GPU, chunked, optional disk-offload)  → data/*.npy (binarized)
    v
 synthetic volumes  (per case dir; 1280^3 cubes → crop to 1024^3, or large 1280×1280×4352 slabs)
    |
-   ├─[DIVERSITY] scripts/0010-diversity-calculation.py        → strided per-block porosity/permeability fields
-   ├─[METRICS]   scripts/0005b-…-new-metrics-evaluator.py     → metrics_<stone>_<pattern>_twophase.npz
-   ├─[LARGE]     scripts/0005d-…-large-subvol.py              → metrics_<stone>_largescale_stride1024_*.npz
-   ├─[PNM-LARGE] scripts/0005-…-large-pnm.py                  → whole-slab 0.network.npz (consumed by 0011)
-   └─[FLOW]      scripts/0011-oil-water-flow.py               → oilwater_results.npz (Corey + Buckley-Leverett)
+   ├─[DIVERSITY] pipelines/fieldcontrolled/0010-diversity-calculation.py        → strided per-block porosity/permeability fields
+   ├─[METRICS]   pipelines/fieldcontrolled/0005b-…-new-metrics-evaluator.py  → metrics_<stone>_<pattern>_twophase.npz
+   ├─[LARGE]     pipelines/fieldcontrolled/0005d-…-large-subvol.py           → metrics_<stone>_largescale_stride1024_*.npz
+   ├─[PNM-LARGE] pipelines/fieldcontrolled/0005-…-large-pnm.py               → whole-slab 0.network.npz (consumed by 0011)
+   └─[FLOW]      pipelines/fieldcontrolled/0011-oil-water-flow.py               → oilwater_results.npz (Corey + Buckley-Leverett)
    |
    v
 [FIGURES]  notebooks/exploratory/dfn/tolatex/scripts/generate_*.py (+ a few notebooks)  →  thesis Figures/
 ```
 
 **Canonical thesis spine:** `0002 → 0003 → 0004e → {0005, 0005b, 0005d-large-subvol,
-0010} → 0005-large-pnm → 0011`. The `0004 / 0004c / 0004d` generators are
-*superseded* by `0004e`. See `docs/SCRIPTS_CATALOG.md` for the full
-canonical-vs-superseded verdict — the numbered prefix is a **lineage, not a
-stable API**.
+0010} → 0005-large-pnm → 0011`. These canonical scripts now live in
+**`pipelines/fieldcontrolled/`** (see its `README.md` for the annotated run order);
+superseded / dead variants (the `0004`/`0004c`/`0004d` generator lineage, the
+drosophila/2D side-experiments, scratch tests, …) were archived to
+**`scripts/old/`**. See `docs/SCRIPTS_CATALOG.md` for the full role + status table.
 
 ---
 
@@ -107,8 +108,9 @@ stable API**.
 | Zone | Tracked | What it is |
 |---|---|---|
 | `diffsci2/` | yes | The installable library: `nets/` (PUNetG U-Net, VAENet, local-attention NATTEN backbone), `models/karras/` (EDM-sigma-space flow `SIModule`/`EDMModule` diffusion core), `models/vae/` (`VAEModule`), `vaesft/` (VAE supervised fine-tune through a frozen reward), `data/` (subvolume datasets + cube-symmetry aug), `distributed/` (spatial/domain parallelism for PUNetG inference), `extra/` (chunked decode, Matérn GP fields, `extra/pore/` PNM physics). |
-| `scripts/` | yes | The numbered `0001`–`0012` experiment lineage (train → generate → evaluate → physics). Many superseded variants — see `docs/SCRIPTS_CATALOG.md`. |
+| `pipelines/fieldcontrolled/` | yes | **The canonical thesis pipeline** (GP-field fit → training → generation → evaluation → oil-water physics). See its `README.md`. |
 | `pipelines/vae/` | yes | Productionized VAE-SFT pipeline (train/eval/smoke). Depends INTO the AI-research playground (see below). |
+| `scripts/` | yes | The **unconditional** training branch (`0009`), general utilities (`download_imperial_rocks.py`, diagnostics), and `scripts/old/` — the tracked archive of superseded/dead numbered scripts. See `docs/SCRIPTS_CATALOG.md`. |
 | `tests/` | yes | Unit tests + `tests/chunk_decode_encode/` correctness suite. |
 | `docs/` | yes | The distilled docs (this `.md` set) alongside a legacy Sphinx stub. |
 | `claude/` | no (gitignored) | Agent-facing plans/reports, including `claude/plan/thesis-reproduction/` (the verified source-of-truth for the thesis pipeline). |

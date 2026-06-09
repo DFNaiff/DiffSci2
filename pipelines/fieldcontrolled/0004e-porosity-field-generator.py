@@ -67,7 +67,7 @@ import numpy as np
 import torch
 
 # Add the aux directory to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'notebooks', 'exploratory', 'dfn', 'aux'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'notebooks', 'exploratory', 'dfn', 'aux'))
 
 import diffsci2.models
 import diffsci2.nets
@@ -83,7 +83,7 @@ LATENT_TO_PIXEL_FACTOR = 8  # pixel_size = latent_size * 8
 MIN_LATENT_MULTIPLE = 16    # latent_size must be multiple of 16
 
 # Base paths
-BASEPATH = os.path.join(os.path.dirname(__file__), '..')
+BASEPATH = os.path.join(os.path.dirname(__file__), '..', '..')
 NOTEBOOKPATH = os.path.join(BASEPATH, 'notebooks', 'exploratory', 'dfn')
 
 # Paths to GP analysis data (fitted in latent space with voxel_size=1.0)

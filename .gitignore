@@ -93,6 +93,7 @@ saveddata/MNIST/*
 saveddata/generated/*
 saveddata/archive/*
 saveddata/gp_training/*
+saveddata/metrics/*
 
 # AI-as-researchers playground (promoted from notebooks/exploratory/dfnai/scripts)
 aiplayground/

@@ -52,7 +52,7 @@ reproducibility corrections **baked in**. Run all commands from the repo root
 
 ## Stage 0 — GP porosity-field fit (`0002`)
 
-`scripts/0002-porosity-field-estimator.py` fits the Matérn GP porosity-field
+`pipelines/fieldcontrolled/0002-porosity-field-estimator.py` fits the Matérn GP porosity-field
 model, producing the per-stone `*_porosity_analysis.npz` (Matérn params:
 `mean_logit`, `matern_sigma_sq`, `matern_nu`, `matern_length_scale`) and the
 `*_porosity_field_full.npy` (1000³ float64) used downstream. The thesis uses two
@@ -79,7 +79,7 @@ conditioned on a local 3D porosity field, in the frozen VAE latent space
 **Variant A — `gpdata4-257`, crop 128, with validation:**
 ```bash
 cd /opt/persistence/repos/DiffSci2
-python scripts/0003-porosity-field-training.py \
+python pipelines/fieldcontrolled/0003-porosity-field-training.py \
     --stone Estaillades \
     --data-source gpdata4-257 \
     --center-crop 128 \
@@ -97,7 +97,7 @@ python scripts/0003-porosity-field-training.py \
 **Variant B — `gpdata4-129`, crop 64, no validation + cosine decay:**
 ```bash
 cd /opt/persistence/repos/DiffSci2
-python scripts/0003-porosity-field-training.py \
+python pipelines/fieldcontrolled/0003-porosity-field-training.py \
     --stone Estaillades \
     --data-source gpdata4-129 \
     --center-crop 64 \
@@ -124,7 +124,7 @@ Swap `--stone` among Bentheimer / Doddington / Estaillades / Ketton.
 ### Stage 2a — latent (multi-GPU, spatial-parallel)
 ```bash
 cd /opt/persistence/repos/DiffSci2
-torchrun --nproc_per_node=8 scripts/0004e-porosity-field-generator.py \
+torchrun --nproc_per_node=8 pipelines/fieldcontrolled/0004e-porosity-field-generator.py \
     --mode latent \
     --checkpoint savedmodels/pore/field_controlled/fc129/estaillades.ckpt \
     --stone Estaillades \
@@ -146,7 +146,7 @@ torchrun --nproc_per_node=8 scripts/0004e-porosity-field-generator.py \
 ### Stage 2b — decode (1 GPU, chunked, optional disk-offload)
 ```bash
 cd /opt/persistence/repos/DiffSci2
-python scripts/0004e-porosity-field-generator.py \
+python pipelines/fieldcontrolled/0004e-porosity-field-generator.py \
     --mode decode \
     --output-dir saveddata/generated/estaillades/pfield_gen_case_10 \
     --device cuda:0 \
@@ -178,7 +178,7 @@ SNOW2 entirely.
 
 ### 3a — Per-cube two-phase metrics (`0005b`, main evaluator)
 ```bash
-python scripts/0005b-porosity-field-new-metrics-evaluator.py \
+python pipelines/fieldcontrolled/0005b-porosity-field-new-metrics-evaluator.py \
   --stone Estaillades --pattern _pfield_gen_case_10 \
   --volume-sizes 1280 --use-cached-network \
   --output saveddata/metrics/metrics_estaillades_pfield-gen-case-10_twophase.npz
@@ -191,7 +191,7 @@ Repeat over the four paper patterns: `_pfield_gen_case_10` (FC-129),
 
 ### 3b — Diversity (`0010`)
 ```bash
-python scripts/0010-diversity-calculation.py \
+python pipelines/fieldcontrolled/0010-diversity-calculation.py \
   --path saveddata/generated/ketton/pfield_gen_case_10/data \
   --stone Ketton --divisions 4 --stride full --recalculate
 # --stride is a MODE word here: full = non-overlap, half = 50% overlap.
@@ -201,7 +201,7 @@ python scripts/0010-diversity-calculation.py \
 
 ### 3c — Large-slab subvolume sweep (`0005d-large-subvol`)
 ```bash
-python scripts/0005d-porosity-field-new-metrics-evaluator-large-subvol.py \
+python pipelines/fieldcontrolled/0005d-porosity-field-new-metrics-evaluator-large-subvol.py \
   --stone Ketton \
   --volume-path saveddata/archive/large_volumes/ketton_pfield_gen_case_10_large/data/0.npy \
   --stride 1024 --use-cached-network \
@@ -215,13 +215,13 @@ python scripts/0005d-porosity-field-new-metrics-evaluator-large-subvol.py \
 ## Stage 4 — PHYSICS (`0005-large-pnm` → `0011`)
 
 ### 4a — Whole-slab network extraction (`0005-large-pnm`)
-`scripts/0005-porosity-field-new-metrics-evaluator-large-pnm.py` extracts the
+`pipelines/fieldcontrolled/0005-porosity-field-new-metrics-evaluator-large-pnm.py` extracts the
 SNOW2 network from the whole large slab and saves `0.network.npz` (no flow).
 This is the producer of the network `0011` consumes.
 
 ### 4b — Oil-water flow + Buckley-Leverett (`0011`)
 ```bash
-python scripts/0011-oil-water-flow.py \
+python pipelines/fieldcontrolled/0011-oil-water-flow.py \
   --network saveddata/archive/large_volumes/estaillades_pfield_gen_case_10_large/data/0.network.npz \
   --voxel-size 3.3116 --n-steps 20
 # --voxel-size is in MICROMETERS here (≠ the meters used by 0005b/0005d/0010).
