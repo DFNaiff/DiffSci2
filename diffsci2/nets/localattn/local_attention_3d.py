@@ -16,6 +16,8 @@ Shape convention: external tensors are ``[B, C, D, H, W]``.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -73,6 +75,18 @@ class LocalSelfAttention3D(nn.Module):
 
     32^3 latent at B=32 is comfortable on a 40 GB card. 3D port is
     memory-unblocked.
+
+    ``legacy_natten_rpb``: opt-in escape hatch to the OLD, numerically
+    BROKEN natten+rbias forward, kept ONLY to reproduce runs trained
+    before 2026-06-10. The legacy path fed ``[B, D, H, W, heads, hd]``
+    tensors to ``na3d_qk``/``na3d_av``, which (natten 0.17.x) expect
+    ``[B, heads, D, H, W, hd]`` — so the "neighborhood" was computed
+    over the (H, W, heads) axes (scrambled attention) — and it never
+    applied the ``1/sqrt(head_dim)`` logit scale that the fused
+    ``na3d`` applies internally. It also hard-crashes when
+    ``kernel_size`` exceeds the heads-axis size (e.g. K=5, 4 heads).
+    Do NOT use for new work. Default False (corrected path).
+    Parameters / state_dict are identical between the two paths.
     """
 
     def __init__(
@@ -82,6 +96,7 @@ class LocalSelfAttention3D(nn.Module):
         kernel_size: int = 3,
         periodic: bool = False,
         radial_pe: bool = False,
+        legacy_natten_rpb: bool = False,
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -91,6 +106,7 @@ class LocalSelfAttention3D(nn.Module):
         self.kernel_size = kernel_size
         self.periodic = periodic
         self.radial_pe = radial_pe
+        self.legacy_natten_rpb = legacy_natten_rpb
 
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
@@ -103,20 +119,44 @@ class LocalSelfAttention3D(nn.Module):
             x = F.pad(x, (r, r, r, r, r, r), mode='circular')
         x_bdhwc = rearrange(x, "b c d h w -> b d h w c")
         qkv = self.qkv(x_bdhwc)
-        q, k, v = rearrange(
-            qkv, "b d h w (three nh hd) -> three b d h w nh hd",
-            three=3, nh=self.num_heads, hd=self.head_dim,
-        ).unbind(0)
         K = self.kernel_size
         if self.rbias is None:
+            q, k, v = rearrange(
+                qkv, "b d h w (three nh hd) -> three b d h w nh hd",
+                three=3, nh=self.num_heads, hd=self.head_dim,
+            ).unbind(0)
             out = na3d(q, k, v, kernel_size=K)
-        else:
+            out = rearrange(out, "b d h w nh hd -> b d h w (nh hd)")
+        elif self.legacy_natten_rpb:
+            # BROKEN legacy path (pre-2026-06-10 runs only): wrong
+            # layout for the split ops + no logit scale. Kept verbatim.
+            q, k, v = rearrange(
+                qkv, "b d h w (three nh hd) -> three b d h w nh hd",
+                three=3, nh=self.num_heads, hd=self.head_dim,
+            ).unbind(0)
             attn = na3d_qk(q, k, kernel_size=K, dilation=1)
             bias = self.rbias.per_offset.to(attn.dtype)  # [heads, K^3]
             attn = attn + bias[None, None, None, None, :, :]
             attn = attn.softmax(dim=-1)
             out = na3d_av(attn, v, kernel_size=K, dilation=1)
-        out = rearrange(out, "b d h w nh hd -> b d h w (nh hd)")
+            out = rearrange(out, "b d h w nh hd -> b d h w (nh hd)")
+        else:
+            # Corrected split path: heads-major layout expected by
+            # na3d_qk / na3d_av, explicit 1/sqrt(hd) scale (the split
+            # qk op, unlike fused na3d, does not scale internally).
+            # The fused na3d cannot train with positional biases, so
+            # this is the only trainable radial-PE route.
+            q, k, v = rearrange(
+                qkv, "b d h w (three nh hd) -> three b nh d h w hd",
+                three=3, nh=self.num_heads, hd=self.head_dim,
+            ).unbind(0)
+            q = (q * (1.0 / math.sqrt(self.head_dim))).contiguous()
+            attn = na3d_qk(q, k.contiguous(), kernel_size=K, dilation=1)
+            bias = self.rbias.per_offset.to(attn.dtype)  # [heads, K^3]
+            attn = attn + bias[None, :, None, None, None, :]
+            attn = attn.softmax(dim=-1)
+            out = na3d_av(attn, v.contiguous(), kernel_size=K, dilation=1)
+            out = rearrange(out, "b nh d h w hd -> b d h w (nh hd)")
         out = self.proj(out)
         out = rearrange(out, "b d h w c -> b c d h w")
         if self.periodic:
@@ -221,6 +261,7 @@ class LocalAttentionBlock3D(nn.Module):
         periodic: bool = False,
         mlp_ratio: float = 4.0,
         radial_pe: bool = False,
+        legacy_natten_rpb: bool = False,
     ):
         super().__init__()
         self.norm_attn = AdaLN3D(dim, cond_dim)
@@ -230,6 +271,7 @@ class LocalAttentionBlock3D(nn.Module):
             kernel_size=kernel_size,
             periodic=periodic,
             radial_pe=radial_pe,
+            legacy_natten_rpb=legacy_natten_rpb,
         )
         self.norm_mlp = AdaLN3D(dim, cond_dim)
         self.mlp = MLP3D(dim, mlp_ratio=mlp_ratio)

@@ -158,6 +158,18 @@ class LocalSelfAttention2D(nn.Module):
     radial_pe: bool
         If True, add a learnable D4-symmetric per-head bias indexed by
         Euclidean distance in the K-window. Default False (NoPE).
+    legacy_natten_rpb: bool
+        Opt-in escape hatch to the OLD, numerically BROKEN natten+rbias
+        forward, kept ONLY to reproduce runs trained before 2026-06-10.
+        The legacy path fed ``[B, H, W, heads, head_dim]`` tensors to
+        ``na2d_qk``/``na2d_av``, which (natten 0.17.x) expect
+        ``[B, heads, H, W, head_dim]`` — so the "neighborhood" was
+        computed over the (W, heads) axes, i.e. scrambled attention —
+        and it never applied the ``1/sqrt(head_dim)`` logit scale that
+        the fused ``na2d`` applies internally. It also hard-crashes for
+        ``kernel_size`` > num_heads+ shapes (e.g. K=5, 4 heads). Do NOT
+        use for new work. Default False (corrected path). Parameters /
+        state_dict are identical between the two paths.
     """
 
     def __init__(
@@ -168,6 +180,7 @@ class LocalSelfAttention2D(nn.Module):
         periodic: bool = False,
         backend: str = 'mask',
         radial_pe: bool = False,
+        legacy_natten_rpb: bool = False,
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -179,6 +192,7 @@ class LocalSelfAttention2D(nn.Module):
         self.periodic = periodic
         self.backend = backend
         self.radial_pe = radial_pe
+        self.legacy_natten_rpb = legacy_natten_rpb
 
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
@@ -235,11 +249,17 @@ class LocalSelfAttention2D(nn.Module):
             materializes any score tensor in user memory. Cheapest
             memory profile.
 
-        (B) ``self.rbias is set``: split
-              attn = na2d_qk(q, k, K)           [B, H, W, heads, K^2]
-              attn = attn + radial_bias[None,None,None,:,:]
+        (B) ``self.rbias is set``: split. The split ops use a
+            DIFFERENT layout from the fused one — heads-major:
+              q, k, v -> permute               [B, heads, H, W, head_d]
+              q = q / sqrt(head_d)             (na2d_qk does NOT scale)
+              attn = na2d_qk(q, k, K)          [B, heads, H, W, K^2]
+              attn = attn + radial_bias[None,:,None,None,:]
               attn = softmax(attn, dim=-1)
-              out  = na2d_av(attn, v, K)        [B, H, W, heads, head_d]
+              out  = na2d_av(attn, v, K)       [B, heads, H, W, head_d]
+            The fused na2d kernel cannot train with positional biases
+            (raises NotImplementedError), so this split path is the
+            only trainable radial-PE route.
             ``attn`` here is K^2-sparse, NOT a full [B, heads, N, N]
             matrix. For 128^2 pixel with B=32, heads=4, K=3:
               attn ~ 32 * 128^2 * 4 * 9 * 2B  ~  38 MB    (cheap)
@@ -258,6 +278,11 @@ class LocalSelfAttention2D(nn.Module):
         NATTEN on the padded tensor, and crop the halo off the output.
         The interior of na2d remains aperiodic; the wrap-around is
         purely in the padding.
+
+        ``self.legacy_natten_rpb``: see the class docstring. The legacy
+        branch reproduces the pre-2026-06-10 BROKEN rbias computation
+        (wrong layout fed to the split ops + missing 1/sqrt(d) scale)
+        and exists only so old checkpoints can be replayed bit-for-bit.
         """
         from natten.functional import na2d, na2d_qk, na2d_av
         if self.periodic:
@@ -266,19 +291,41 @@ class LocalSelfAttention2D(nn.Module):
         B, C, H, W = x.shape
         x_bhwc = rearrange(x, "b c h w -> b h w c")
         qkv = self.qkv(x_bhwc)
-        q, k, v = rearrange(
-            qkv, "b h w (three nh d) -> three b h w nh d",
-            three=3, nh=self.num_heads, d=self.head_dim,
-        ).unbind(0)
         if self.rbias is None:
+            q, k, v = rearrange(
+                qkv, "b h w (three nh d) -> three b h w nh d",
+                three=3, nh=self.num_heads, d=self.head_dim,
+            ).unbind(0)
             out = na2d(q, k, v, kernel_size=self.kernel_size)
-        else:
+            out = rearrange(out, "b h w nh d -> b h w (nh d)")
+        elif self.legacy_natten_rpb:
+            # BROKEN legacy path (pre-2026-06-10 runs only): wrong
+            # layout for the split ops + no logit scale. Kept verbatim.
+            q, k, v = rearrange(
+                qkv, "b h w (three nh d) -> three b h w nh d",
+                three=3, nh=self.num_heads, d=self.head_dim,
+            ).unbind(0)
             attn = na2d_qk(q, k, kernel_size=self.kernel_size)
             bias = self.rbias.per_offset.to(attn.dtype)  # [heads, K^2]
             attn = attn + bias[None, None, None, :, :]
             attn = attn.softmax(dim=-1)
             out = na2d_av(attn, v, kernel_size=self.kernel_size)
-        out = rearrange(out, "b h w nh d -> b h w (nh d)")
+            out = rearrange(out, "b h w nh d -> b h w (nh d)")
+        else:
+            # Corrected split path: heads-major layout expected by
+            # na2d_qk / na2d_av, explicit 1/sqrt(d) scale (the split
+            # qk op, unlike fused na2d, does not scale internally).
+            q, k, v = rearrange(
+                qkv, "b h w (three nh d) -> three b nh h w d",
+                three=3, nh=self.num_heads, d=self.head_dim,
+            ).unbind(0)
+            q = (q * (1.0 / math.sqrt(self.head_dim))).contiguous()
+            attn = na2d_qk(q, k.contiguous(), kernel_size=self.kernel_size)
+            bias = self.rbias.per_offset.to(attn.dtype)  # [heads, K^2]
+            attn = attn + bias[None, :, None, None, :]
+            attn = attn.softmax(dim=-1)
+            out = na2d_av(attn, v.contiguous(), kernel_size=self.kernel_size)
+            out = rearrange(out, "b nh h w d -> b h w (nh d)")
         out = self.proj(out)
         out = rearrange(out, "b h w c -> b c h w")
         if self.periodic:
@@ -375,6 +422,7 @@ class LocalAttentionBlock2D(nn.Module):
         mlp_ratio: float = 4.0,
         backend: str = 'mask',
         radial_pe: bool = False,
+        legacy_natten_rpb: bool = False,
     ):
         super().__init__()
         self.norm_attn = AdaLN(dim, cond_dim)
@@ -385,6 +433,7 @@ class LocalAttentionBlock2D(nn.Module):
             periodic=periodic,
             backend=backend,
             radial_pe=radial_pe,
+            legacy_natten_rpb=legacy_natten_rpb,
         )
         self.norm_mlp = AdaLN(dim, cond_dim)
         self.mlp = MLP(dim, mlp_ratio=mlp_ratio)

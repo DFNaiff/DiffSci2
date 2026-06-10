@@ -32,6 +32,10 @@ class LADitConfig:
     fourier_dim: int = 256
     backend: str = 'mask'  # 'mask' or 'natten'
     radial_pe: bool = False
+    # Opt-in to the pre-2026-06-10 BROKEN natten+radial_pe forward
+    # (wrong split-op layout + missing 1/sqrt(d) scale). Only for
+    # reproducing old runs; see LocalSelfAttention2D docstring.
+    legacy_natten_rpb: bool = False
 
 
 class LADit(nn.Module):
@@ -56,6 +60,7 @@ class LADit(nn.Module):
                 mlp_ratio=config.mlp_ratio,
                 backend=config.backend,
                 radial_pe=config.radial_pe,
+                legacy_natten_rpb=config.legacy_natten_rpb,
             )
             for _ in range(config.depth)
         ])
