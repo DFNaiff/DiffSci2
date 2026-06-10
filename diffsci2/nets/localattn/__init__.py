@@ -55,6 +55,7 @@ from .la_unet_3d import (
     TimeMLP3D,
 )
 from .la_dit import LADit, LADitConfig
+from .perf import enable_fast_natten
 
 __all__ = [
     # 2D primitives
@@ -83,4 +84,6 @@ __all__ = [
     'GaussianFourierProjection3D', 'TimeMLP3D',
     # Mode flip
     'set_periodic',
+    # Perf (opt-in, never called by default)
+    'enable_fast_natten',
 ]
