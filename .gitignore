@@ -141,3 +141,5 @@ temp.txt
 .env.local
 
 .claude/
+
+keys/
