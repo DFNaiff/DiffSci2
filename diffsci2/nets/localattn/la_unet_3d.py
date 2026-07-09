@@ -84,6 +84,7 @@ class LAUNet3DConfig:
     cond_dim: int = 256
     fourier_dim: int = 256
     radial_pe: bool = False
+    qk_norm: bool = False
     # Opt-in to the pre-2026-06-10 BROKEN natten+radial_pe forward
     # (wrong split-op layout + missing 1/sqrt(d) scale). Only for
     # reproducing old runs; see LocalSelfAttention3D docstring.
@@ -118,6 +119,7 @@ class LAUNet3D(nn.Module):
                 periodic=config.periodic,
                 mlp_ratio=config.mlp_ratio,
                 radial_pe=config.radial_pe,
+                qk_norm=config.qk_norm,
                 legacy_natten_rpb=config.legacy_natten_rpb,
             )
 

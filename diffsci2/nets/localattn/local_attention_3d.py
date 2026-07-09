@@ -97,6 +97,7 @@ class LocalSelfAttention3D(nn.Module):
         periodic: bool = False,
         radial_pe: bool = False,
         legacy_natten_rpb: bool = False,
+        qk_norm: bool = False,
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -110,6 +111,11 @@ class LocalSelfAttention3D(nn.Module):
 
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
+        # qk-norm (ViT-22B style, per-head LayerNorm on q and k): bounds
+        # attention logits; candidate fix for training-collapse /
+        # entropy-saturation pathologies (2026-07-08, s7 arms). Opt-in.
+        self.q_norm = nn.LayerNorm(self.head_dim) if qk_norm else None
+        self.k_norm = nn.LayerNorm(self.head_dim) if qk_norm else None
         self.rbias = RadialBias3D(num_heads, kernel_size) if radial_pe else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -125,6 +131,8 @@ class LocalSelfAttention3D(nn.Module):
                 qkv, "b d h w (three nh hd) -> three b d h w nh hd",
                 three=3, nh=self.num_heads, hd=self.head_dim,
             ).unbind(0)
+            if self.q_norm is not None:
+                q, k = self.q_norm(q), self.k_norm(k)
             out = na3d(q, k, v, kernel_size=K)
             out = rearrange(out, "b d h w nh hd -> b d h w (nh hd)")
         elif self.legacy_natten_rpb:
@@ -150,6 +158,8 @@ class LocalSelfAttention3D(nn.Module):
                 qkv, "b d h w (three nh hd) -> three b nh d h w hd",
                 three=3, nh=self.num_heads, hd=self.head_dim,
             ).unbind(0)
+            if self.q_norm is not None:
+                q, k = self.q_norm(q), self.k_norm(k)
             q = (q * (1.0 / math.sqrt(self.head_dim))).contiguous()
             attn = na3d_qk(q, k.contiguous(), kernel_size=K, dilation=1)
             bias = self.rbias.per_offset.to(attn.dtype)  # [heads, K^3]
@@ -165,6 +175,40 @@ class LocalSelfAttention3D(nn.Module):
         return out
 
 
+class SpatialCond:
+    """Spatially-varying conditioning for adaLN (scalar-to-field, article
+    part 2, 2026-07-09). Holds a global base embedding [B, C] (sigma) plus
+    a field embedding [B, fd, fh, fw, C] (pointwise phi embed at the node
+    grid). ``at(size)`` returns the summed cond map at a block's token
+    resolution (trilinear on the field part), cached per size.
+
+    A CONSTANT field reproduces the global-scalar path exactly (the same
+    embedding everywhere), so scalar-trained checkpoints run zero-shot."""
+
+    def __init__(self, base, field_emb):
+        self.base = base                    # [B, C]
+        self.field_emb = field_emb          # [B, fd, fh, fw, C]
+        self._cache = {}
+
+    def at(self, size):
+        key = tuple(size)
+        if key not in self._cache:
+            fe = self.field_emb.permute(0, 4, 1, 2, 3)          # B C f f f
+            fe = torch.nn.functional.interpolate(
+                fe, size=key, mode='trilinear', align_corners=False)
+            fe = fe.permute(0, 2, 3, 4, 1)                      # B d h w C
+            self._cache[key] = fe + self.base[:, None, None, None, :]
+        return self._cache[key]
+
+
+def _bc3d(v: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """Broadcast a modulation tensor over space: [B, dim] -> [B,dim,1,1,1];
+    channels-last spatial [B,d,h,w,dim] -> [B,dim,d,h,w]."""
+    if v.dim() == 2:
+        return v[:, :, None, None, None]
+    return v.permute(0, 4, 1, 2, 3)
+
+
 def modulate3d(
     x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor,
 ) -> torch.Tensor:
@@ -175,10 +219,7 @@ def modulate3d(
     whose style-transfer ancestor is AdaIN (Huang & Belongie 2017) /
     StyleGAN (Karras et al. 2019).
     """
-    return (
-        x * (1.0 + scale[:, :, None, None, None])
-        + shift[:, :, None, None, None]
-    )
+    return x * (1.0 + _bc3d(scale, x)) + _bc3d(shift, x)
 
 
 class AdaLN3D(nn.Module):
@@ -219,6 +260,8 @@ class AdaLN3D(nn.Module):
     def forward(
         self, x: torch.Tensor, cond: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(cond, SpatialCond):
+            cond = cond.at(x.shape[-3:])
         x_b = rearrange(x, "b c d h w -> b d h w c")
         x_b = self.norm(x_b)
         x = rearrange(x_b, "b d h w c -> b c d h w")
@@ -262,6 +305,7 @@ class LocalAttentionBlock3D(nn.Module):
         mlp_ratio: float = 4.0,
         radial_pe: bool = False,
         legacy_natten_rpb: bool = False,
+        qk_norm: bool = False,
     ):
         super().__init__()
         self.norm_attn = AdaLN3D(dim, cond_dim)
@@ -272,6 +316,7 @@ class LocalAttentionBlock3D(nn.Module):
             periodic=periodic,
             radial_pe=radial_pe,
             legacy_natten_rpb=legacy_natten_rpb,
+            qk_norm=qk_norm,
         )
         self.norm_mlp = AdaLN3D(dim, cond_dim)
         self.mlp = MLP3D(dim, mlp_ratio=mlp_ratio)
@@ -281,7 +326,7 @@ class LocalAttentionBlock3D(nn.Module):
         # (NOT zero) — the branch is silenced by the gate below, not by
         # the modulation. gate==0 at init => x unchanged.
         h, gate_a = self.norm_attn(x, cond)
-        x = x + gate_a[:, :, None, None, None] * self.attn(h)
+        x = x + _bc3d(gate_a, x) * self.attn(h)
         h, gate_m = self.norm_mlp(x, cond)
-        x = x + gate_m[:, :, None, None, None] * self.mlp(h)
+        x = x + _bc3d(gate_m, x) * self.mlp(h)
         return x
