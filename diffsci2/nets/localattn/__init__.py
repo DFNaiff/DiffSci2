@@ -87,3 +87,6 @@ __all__ = [
     # Perf (opt-in, never called by default)
     'enable_fast_natten',
 ]
+
+from .conditioned_3d import (  # noqa: F401,E402
+    ScalarCondLAUNet3D, build_scalar_launet_3d)
